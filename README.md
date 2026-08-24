@@ -106,13 +106,25 @@ IAM → **Policies** → **Create policy** → **JSON** tab. Paste the contents 
 [`controlnode/iam-policy.json`](controlnode/iam-policy.json) and name it
 `ansible-strongdm-demo`.
 
-This grants the EC2 permissions the playbook needs to build the worker — split
-into a read-only statement (describe VPCs, subnets, AMIs) and a write statement
-(run/terminate instances, manage security groups and Elastic IPs).
+This grants the EC2 permissions the playbook needs to build the worker: an
+unconditional `ec2:Describe*` for reads, and `ec2:*` for writes **fenced to a
+single region** by an `aws:RequestedRegion` condition — currently `us-east-2`.
 
-The write statement is scoped by an `aws:RequestedRegion` condition, currently
-`us-east-2`. **It must match `aws_region` in `group_vars/all.yml`** or every EC2
-call the playbook makes returns `UnauthorizedOperation`.
+**That condition must match `aws_region` in `group_vars/all.yml`**, or every EC2
+call returns `UnauthorizedOperation`.
+
+> **Why `ec2:*` and not an enumerated list?** An earlier version of this policy
+> listed individual actions. It kept failing one action at a time — the
+> `amazon.aws` modules make calls that aren't obvious from the task names, like
+> `DescribeVpcAttribute` when looking up a VPC or
+> `UpdateSecurityGroupRuleDescriptionsEgress` when a rule carries a description.
+> For a sandbox demo, a region fence is the useful boundary; enumerating actions
+> just moves the failure later. If you need tight scoping, generate the real list
+> from CloudTrail after one successful run rather than guessing — that's the only
+> way to get it right.
+
+The region fence is doing real work here: this role cannot touch EC2 anywhere
+outside `us-east-2`, so a mistake stays contained to your sandbox region.
 
 > Create the policy as its own object rather than inline on the role. The Create
 > Role wizard can only *attach* policies that already exist — if you start with
@@ -481,6 +493,15 @@ or Part 3 commands run locally — switch to the Session Manager tab.
 The venv isn't active in this shell. Run
 `source ~/.venv/ansible/bin/activate`. The `.bashrc` line added in 1.5 covers
 future logins but not the shell that created it.
+
+**`UnauthorizedOperation`, or any AWS module failing on a specific API call**
+The instance profile's policy is missing that action, or the region fence
+doesn't match `aws_region`. Symptoms look unrelated to permissions — e.g.
+`Unable to describe VPC attribute enableDnsSupport` or `Failed to update
+security group rule descriptions egress`. Re-apply
+[`controlnode/iam-policy.json`](controlnode/iam-policy.json) (IAM → Policies →
+Edit → paste → Save creates a new active version) and confirm its
+`aws:RequestedRegion` matches your region.
 
 **`No help topic for 'version'` (rc 3)**
 `--version` is a global flag on the `sdm` binary, not a subcommand. Use
