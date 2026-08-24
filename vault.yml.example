@@ -1,0 +1,25 @@
+---
+# ============================================================================
+# Copy to vault.yml, fill in, then encrypt:
+#
+#   cp vault.yml.example vault.yml
+#   $EDITOR vault.yml
+#   ansible-vault encrypt vault.yml
+#
+# ansible.cfg expects the vault password in ~/.ansible-vault-pass (mode 0600).
+# Do not commit vault.yml or that password file.
+# ============================================================================
+
+# StrongDM admin token or service account token, from the Admin UI under
+# Settings > Admin Tokens. The playbook exports this as SDM_ADMIN_TOKEN so the
+# sdm CLI can authenticate without an interactive login.
+#
+# Scope it to the minimum your sandbox allows. A token with node-management
+# rights is enough; it does not need resource or user administration.
+sdm_admin_token: "REPLACE_ME"
+
+# Only needed if you are supplying a pre-existing cluster instead of letting
+# the playbook create one. See "Bring your own cluster" in the README.
+#
+# sdm_proxy_cluster_access_key: "pk-0123456789abcdef"
+# sdm_proxy_cluster_secret_key: "REPLACE_ME"

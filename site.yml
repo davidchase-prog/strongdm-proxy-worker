@@ -1,0 +1,536 @@
+---
+# ===========================================================================
+# Install a StrongDM proxy cluster worker natively (binary + systemd) on EC2
+# ===========================================================================
+#
+#   ansible-playbook site.yml
+#
+# Play 1 runs on the control node and provisions AWS infrastructure.
+# Play 2 runs on the new instance and installs the worker.
+#
+# Terminology note: a "proxy worker" is a member of a StrongDM *proxy cluster*
+# (systemd unit sdm-worker, authenticates with an access key + secret key).
+# It is NOT the older gateway/relay node model (unit sdm-proxy, JWT token).
+# Both ship in the same sdm binary but take different install flags.
+#
+# Docs: https://docs.strongdm.com/admin/networking/proxy-clusters
+# ===========================================================================
+
+- name: Provision the EC2 instance that will host the proxy worker
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vault.yml
+
+  tasks:
+
+    # -- Preflight ---------------------------------------------------------
+
+    - name: Assert that the StrongDM admin token is set
+      ansible.builtin.assert:
+        that:
+          - sdm_admin_token is defined
+          - sdm_admin_token | length > 0
+          - sdm_admin_token != "REPLACE_ME"
+        fail_msg: >-
+          sdm_admin_token is not set. Copy vault.yml.example to vault.yml, add
+          an admin token from the StrongDM Admin UI (Settings > Admin Tokens),
+          then encrypt it with `ansible-vault encrypt vault.yml`.
+        quiet: true
+
+    - name: Assert that the sdm CLI is present on the control node
+      ansible.builtin.command: sdm version
+      register: sdm_version
+      changed_when: false
+      failed_when: sdm_version.rc != 0
+
+    - name: Show the sdm CLI version in use
+      ansible.builtin.debug:
+        msg: "Control node sdm CLI: {{ sdm_version.stdout | trim }}"
+
+    # -- Network lookups ---------------------------------------------------
+    # Resolve the default VPC and a subnet unless the operator pinned them in
+    # group_vars. Keeping this dynamic is what makes the demo reproducible in
+    # any sandbox account without editing variables first.
+
+    - name: Look up the default VPC
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ aws_region }}"
+        filters:
+          isDefault: "true"
+      register: default_vpc
+      when: vpc_id | length == 0
+
+    - name: Set the target VPC
+      ansible.builtin.set_fact:
+        target_vpc_id: >-
+          {{ vpc_id if vpc_id | length > 0
+             else (default_vpc.vpcs | first).vpc_id }}
+
+    - name: Look up subnets in the target VPC
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ aws_region }}"
+        filters:
+          vpc-id: "{{ target_vpc_id }}"
+          state: available
+      register: vpc_subnets
+      when: subnet_id | length == 0
+
+    - name: Set the target subnet
+      ansible.builtin.set_fact:
+        target_subnet_id: >-
+          {{ subnet_id if subnet_id | length > 0
+             else (vpc_subnets.subnets | sort(attribute='availability_zone') | first).subnet_id }}
+
+    - name: Report the resolved network
+      ansible.builtin.debug:
+        msg: "Deploying into VPC {{ target_vpc_id }} / subnet {{ target_subnet_id }} in {{ aws_region }}"
+
+    # -- SSH key -----------------------------------------------------------
+    # Generated locally rather than downloaded from AWS, so the private key
+    # never transits the API and re-runs are idempotent.
+
+    - name: Generate an SSH keypair for the demo
+      community.crypto.openssh_keypair:
+        path: "{{ ssh_key_path | expanduser }}"
+        type: ed25519
+        comment: "strongdm-ansible-demo"
+        mode: "0600"
+      register: demo_ssh_key
+
+    - name: Register the public key with EC2
+      amazon.aws.ec2_key:
+        region: "{{ aws_region }}"
+        name: "{{ ssh_key_name }}"
+        key_material: "{{ demo_ssh_key.public_key }}"
+        tags: "{{ resource_tags }}"
+        state: present
+
+    # -- Security group ----------------------------------------------------
+    # Two rules only:
+    #   443 from client CIDRs  -> StrongDM clients connecting to the worker
+    #   22  from control node  -> Ansible itself
+    # Everything the worker needs outbound (app.strongdm.com,
+    # downloads.strongdm.com, and the resources it proxies) rides the default
+    # allow-all egress rule.
+
+    - name: Create the proxy worker security group
+      amazon.aws.ec2_security_group:
+        region: "{{ aws_region }}"
+        name: "{{ worker_name }}-sg"
+        description: "StrongDM proxy worker - client ingress and Ansible SSH"
+        vpc_id: "{{ target_vpc_id }}"
+        tags: "{{ resource_tags }}"
+        rules:
+          - proto: tcp
+            ports:
+              - "{{ sdm_worker_bind_port }}"
+            cidr_ip: "{{ client_ingress_cidrs }}"
+            rule_desc: "StrongDM client traffic to the proxy worker"
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: >-
+              {{ ssh_ingress_cidrs if ssh_ingress_cidrs | length > 0
+                 else [ansible_default_ipv4.address ~ '/32'] }}
+            rule_desc: "SSH from the Ansible control node"
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "Worker egress to StrongDM control plane and resources"
+        state: present
+      register: worker_sg
+
+    # -- AMI ---------------------------------------------------------------
+    # Resolved at runtime rather than hardcoded, so the playbook keeps working
+    # as Amazon Linux 2023 gets rebuilt.
+
+    - name: Find the newest Amazon Linux 2023 AMI
+      amazon.aws.ec2_ami_info:
+        region: "{{ aws_region }}"
+        owners:
+          - amazon
+        filters:
+          name: "al2023-ami-2023.*-kernel-6.1-x86_64"
+          state: available
+          architecture: x86_64
+          root-device-type: ebs
+          virtualization-type: hvm
+      register: al2023_amis
+
+    - name: Select the most recent AMI
+      ansible.builtin.set_fact:
+        worker_ami_id: >-
+          {{ (al2023_amis.images | sort(attribute='creation_date') | last).image_id }}
+
+    - name: Report the selected AMI
+      ansible.builtin.debug:
+        msg: >-
+          Using AMI {{ worker_ami_id }}
+          ({{ (al2023_amis.images | sort(attribute='creation_date') | last).name }})
+
+    # -- Instance ----------------------------------------------------------
+
+    - name: Launch the proxy worker instance
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        name: "{{ worker_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ worker_ami_id }}"
+        key_name: "{{ ssh_key_name }}"
+        vpc_subnet_id: "{{ target_subnet_id }}"
+        security_groups:
+          - "{{ worker_sg.group_id }}"
+        volumes:
+          - device_name: /dev/xvda
+            ebs:
+              volume_size: "{{ root_volume_gb }}"
+              volume_type: gp3
+              delete_on_termination: true
+        tags: "{{ resource_tags }}"
+        state: running
+        wait: true
+        wait_timeout: 600
+      register: worker_instance
+
+    - name: Set the instance id
+      ansible.builtin.set_fact:
+        worker_instance_id: "{{ (worker_instance.instances | first).instance_id }}"
+        worker_private_ip: "{{ (worker_instance.instances | first).private_ip_address }}"
+
+    # An Elastic IP matters more than it looks. StrongDM ties the cluster's
+    # advertised address to this IP, and there is no way to change a node's
+    # address after creation - so a reboot that reassigns a dynamic public IP
+    # would orphan the cluster. The EIP makes the demo survive stop/start.
+
+    - name: Allocate and associate an Elastic IP
+      amazon.aws.ec2_eip:
+        region: "{{ aws_region }}"
+        device_id: "{{ worker_instance_id }}"
+        in_vpc: true
+        release_on_disassociation: false
+        tags: "{{ resource_tags }}"
+        state: present
+      register: worker_eip
+
+    - name: Set the worker public address
+      ansible.builtin.set_fact:
+        worker_public_ip: "{{ worker_eip.public_ip }}"
+        worker_advertised_address: "{{ worker_eip.public_ip }}:{{ sdm_worker_bind_port }}"
+
+    - name: Wait for SSH to accept connections
+      ansible.builtin.wait_for:
+        host: "{{ worker_private_ip }}"
+        port: 22
+        delay: 5
+        timeout: 300
+        state: started
+
+    - name: Add the worker to the in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ worker_name }}"
+        groups: sdm_workers
+        ansible_host: "{{ worker_private_ip }}"
+        ansible_user: "{{ remote_user }}"
+        ansible_ssh_private_key_file: "{{ ssh_key_path | expanduser }}"
+        worker_public_ip: "{{ worker_public_ip }}"
+        worker_private_ip: "{{ worker_private_ip }}"
+        worker_instance_id: "{{ worker_instance_id }}"
+        worker_advertised_address: "{{ worker_advertised_address }}"
+
+    - name: Summarise the provisioned instance
+      ansible.builtin.debug:
+        msg:
+          - "Instance:   {{ worker_instance_id }}"
+          - "Private IP: {{ worker_private_ip }}"
+          - "Public IP:  {{ worker_public_ip }}"
+          - "Advertised: {{ worker_advertised_address }}"
+
+
+# ===========================================================================
+
+- name: Create the proxy cluster and install the worker
+  hosts: sdm_workers
+  gather_facts: true
+  become: true
+  # Stated explicitly because the cluster-creation tasks below use run_once,
+  # which does not behave predictably under the free strategy.
+  strategy: linear
+  vars_files:
+    - vault.yml
+
+  handlers:
+    - name: Restart the StrongDM worker
+      ansible.builtin.systemd_service:
+        name: "{{ sdm_service_name }}"
+        state: restarted
+
+  tasks:
+
+    # -- Create the cluster in StrongDM ------------------------------------
+    # Runs on the control node (delegate_to: localhost) because that is where
+    # the authenticated sdm CLI lives. The instance itself never holds an
+    # admin token - it only ever receives a cluster-scoped key pair.
+
+    - name: Check whether the proxy cluster already exists
+      ansible.builtin.command:
+        cmd: sdm admin nodes list --filter "name:{{ sdm_cluster_name }}"
+      environment:
+        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: existing_cluster
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Decide whether a key pair was supplied
+      ansible.builtin.set_fact:
+        byo_cluster: >-
+          {{ (sdm_proxy_cluster_access_key | default('') | length > 0)
+             and (sdm_proxy_cluster_secret_key | default('') | length > 0) }}
+
+    - name: Create the proxy cluster
+      ansible.builtin.command:
+        cmd: >-
+          sdm admin nodes create-proxy-cluster
+          --name {{ sdm_cluster_name }}
+          --tags Project=strongdm-ansible-demo,ManagedBy=ansible
+          {{ worker_advertised_address }}
+      environment:
+        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: cluster_create
+      changed_when: cluster_create.rc == 0
+      when: not byo_cluster | bool
+      no_log: true
+
+    # `create-proxy-cluster` prints the cluster's first authentication key on
+    # success. The exact output format is not documented, so parse defensively
+    # and fail with instructions rather than dying on an index error.
+
+    - name: Extract the cluster authentication key pair
+      vars:
+        # regex_findall returns the capture groups as a list, which avoids
+        # backreference escaping entirely. An empty list is a clean "not found".
+        _cluster_out: "{{ cluster_create.stdout | default('') }}"
+        _access_matches: "{{ _cluster_out | regex_findall('pk-[0-9a-zA-Z]{8,}') }}"
+        _secret_matches: "{{ _cluster_out | regex_findall('secret[-_ ]?key[ :=]*([A-Za-z0-9+/=_-]{16,})', ignorecase=true) }}"
+      ansible.builtin.set_fact:
+        parsed_access_key: "{{ _access_matches[0] if _access_matches | length > 0 else '' }}"
+        parsed_secret_key: "{{ _secret_matches[0] if _secret_matches | length > 0 else '' }}"
+      run_once: true
+      when: not byo_cluster | bool
+      no_log: true
+
+    - name: Settle on the credentials the worker will use
+      ansible.builtin.set_fact:
+        worker_access_key: >-
+          {{ sdm_proxy_cluster_access_key if byo_cluster | bool
+             else parsed_access_key | default('') }}
+        worker_secret_key: >-
+          {{ sdm_proxy_cluster_secret_key if byo_cluster | bool
+             else parsed_secret_key | default('') }}
+      no_log: true
+
+    - name: Fail with guidance if no key pair could be obtained
+      ansible.builtin.fail:
+        msg: |
+          Could not determine the proxy cluster authentication key pair.
+
+          The cluster may still have been created. Finish manually:
+
+            1. StrongDM Admin UI > Networking > Proxy Clusters
+            2. Open "{{ sdm_cluster_name }}" > Keys tab > Add authentication key
+            3. Put the pair into vault.yml as:
+                 sdm_proxy_cluster_access_key: "pk-..."
+                 sdm_proxy_cluster_secret_key: "..."
+            4. Re-run this playbook. It will skip cluster creation and go
+               straight to installing the worker.
+
+          See README "Bring your own cluster".
+      when:
+        - worker_access_key | length == 0 or worker_secret_key | length == 0
+
+    # -- Host preparation --------------------------------------------------
+
+    - name: Set the hostname
+      ansible.builtin.hostname:
+        name: "{{ worker_name }}"
+
+    - name: Install packages the StrongDM installer needs
+      ansible.builtin.dnf:
+        name:
+          - unzip
+          - tar
+          - policycoreutils-python-utils
+        state: present
+        update_cache: true
+
+    # StrongDM's docs say to disable SELinux before installing. Amazon Linux
+    # 2023 ships it enabled in permissive mode, which is already compatible;
+    # this only intervenes if something turned enforcing on.
+    - name: Check the current SELinux mode
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+      failed_when: false
+
+    - name: Set SELinux to permissive if it is enforcing
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+      when: selinux_mode.stdout | default('') | trim == 'Enforcing'
+
+    - name: Create the StrongDM install directory
+      ansible.builtin.file:
+        path: "{{ sdm_download_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # -- Download and install ----------------------------------------------
+
+    - name: Check whether the worker is already installed
+      ansible.builtin.stat:
+        path: "{{ sdm_env_file }}"
+      register: sdm_installed
+
+    - name: Download the StrongDM CLI archive
+      ansible.builtin.get_url:
+        url: "https://{{ sdm_app_domain }}/releases/cli/linux"
+        dest: "{{ sdm_download_dir }}/sdmcli_linux_amd64.zip"
+        mode: "0644"
+        owner: root
+        group: root
+      when: not sdm_installed.stat.exists
+
+    - name: Unpack the sdm binary
+      ansible.builtin.unarchive:
+        src: "{{ sdm_download_dir }}/sdmcli_linux_amd64.zip"
+        dest: "{{ sdm_download_dir }}"
+        remote_src: true
+        creates: "{{ sdm_download_dir }}/sdm"
+        owner: root
+        group: root
+        mode: "0755"
+      when: not sdm_installed.stat.exists
+
+    # The documented install flow is interactive: it prompts for the access key
+    # and then the secret key. Two things make it unattended here -
+    #   1. the keys are exported as SDM_PROXY_CLUSTER_* env vars, which the
+    #      worker reads natively, and
+    #   2. the same pair is piped on stdin, which satisfies the prompts if the
+    #      installer asks anyway.
+    # Whichever path the binary takes, the task completes without a TTY.
+    #
+    # `creates:` makes this idempotent - a second run is a no-op.
+    - name: Install the StrongDM proxy worker as a systemd service
+      ansible.builtin.command:
+        cmd: >-
+          {{ sdm_download_dir }}/sdm install --worker
+          --worker-bind-addr :{{ sdm_worker_bind_port }}
+          --app-domain {{ sdm_app_domain }}
+        chdir: "{{ sdm_download_dir }}"
+        stdin: "{{ worker_access_key }}\n{{ worker_secret_key }}"
+        creates: "{{ sdm_env_file }}"
+      environment:
+        SDM_PROXY_CLUSTER_ACCESS_KEY: "{{ worker_access_key }}"
+        SDM_PROXY_CLUSTER_SECRET_KEY: "{{ worker_secret_key }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      register: sdm_install
+      no_log: true
+
+    # -- Post-install configuration ----------------------------------------
+    # The installer writes /etc/sysconfig/sdm-worker itself, so extra settings
+    # are layered in with lineinfile rather than templating the whole file and
+    # clobbering what the installer put there.
+
+    - name: Ensure the credentials are persisted in the environment file
+      ansible.builtin.lineinfile:
+        path: "{{ sdm_env_file }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        owner: root
+        group: root
+        mode: "0600"
+        create: true
+      loop:
+        - { key: SDM_PROXY_CLUSTER_ACCESS_KEY, value: "{{ worker_access_key }}" }
+        - { key: SDM_PROXY_CLUSTER_SECRET_KEY, value: "{{ worker_secret_key }}" }
+        - { key: SDM_APP_DOMAIN, value: "{{ sdm_app_domain }}" }
+      loop_control:
+        label: "{{ item.key }}"
+      no_log: true
+      notify: Restart the StrongDM worker
+
+    - name: Apply optional environment settings
+      ansible.builtin.lineinfile:
+        path: "{{ sdm_env_file }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - { key: HTTP_PROXY, value: "{{ sdm_http_proxy }}" }
+        - { key: HTTPS_PROXY, value: "{{ sdm_https_proxy }}" }
+        - { key: NO_PROXY, value: "{{ sdm_no_proxy }}" }
+        - { key: SDM_DISABLE_UPDATE, value: "{{ sdm_disable_update | lower }}" }
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value | string | length > 0
+      notify: Restart the StrongDM worker
+
+    - name: Flush handlers so the service picks up configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure the worker service is enabled and running
+      ansible.builtin.systemd_service:
+        name: "{{ sdm_service_name }}"
+        state: started
+        enabled: true
+        daemon_reload: true
+      register: sdm_service
+
+    # -- Verification ------------------------------------------------------
+
+    - name: Wait for the worker to bind its client port
+      ansible.builtin.wait_for:
+        port: "{{ sdm_worker_bind_port }}"
+        host: 0.0.0.0
+        timeout: 120
+        state: started
+
+    # A healthy proxy worker answers HTTPS with 404 - it is a TLS proxy, not a
+    # web server, so 404 is the documented success signal.
+    - name: Confirm the worker answers with HTTP 404
+      ansible.builtin.uri:
+        url: "https://{{ worker_private_ip }}:{{ sdm_worker_bind_port }}"
+        validate_certs: false
+        status_code:
+          - 404
+        timeout: 30
+      register: worker_probe
+      retries: 6
+      delay: 10
+      until: worker_probe is succeeded
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "Proxy worker installed natively via binary + systemd."
+          - "Cluster:    {{ sdm_cluster_name }}"
+          - "Advertised: {{ worker_advertised_address }}"
+          - "Service:    {{ sdm_service_name }} ({{ sdm_service.status.ActiveState | default('unknown') }})"
+          - "Probe:      HTTP {{ worker_probe.status }} (404 = healthy)"
+          - ""
+          - "Next: attach a resource to this cluster in the Admin UI under"
+          - "Networking > Proxy Clusters, or with --proxy-cluster-id at the CLI."

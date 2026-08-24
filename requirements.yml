@@ -1,0 +1,12 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+collections:
+  # 6.0+ required: ec2_eip moved into amazon.aws in that release, and the
+  # ec2_security_group / ec2_instance parameter names used in site.yml
+  # settled there.
+  - name: amazon.aws
+    version: ">=6.0.0"
+  - name: community.crypto
+    version: ">=2.0.0"
+  - name: ansible.posix
+    version: ">=1.5.0"

@@ -1,0 +1,20 @@
+# Secrets — never commit these
+vault.yml
+*.vault
+.ansible-vault-pass
+
+# SSH keys
+*.pem
+id_ed25519*
+sdm-ansible-demo*
+
+# Ansible runtime
+*.retry
+.ansible/
+collections/
+.venv/
+__pycache__/
+
+# macOS / Office cruft
+.DS_Store
+~$*

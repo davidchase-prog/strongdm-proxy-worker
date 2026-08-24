@@ -1,0 +1,23 @@
+---
+extends: default
+
+rules:
+  line-length:
+    max: 160
+    level: warning
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  # Both of the following are required for compatibility with ansible-lint's
+  # bundled yamllint config; it refuses to run in fix mode otherwise.
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+
+ignore: |
+  .venv/

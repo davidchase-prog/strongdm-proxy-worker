@@ -1,0 +1,127 @@
+---
+# ===========================================================================
+# Destroy everything site.yml created
+# ===========================================================================
+#
+#   ansible-playbook teardown.yml
+#
+# Runs in reverse dependency order: StrongDM cluster, then EIP, instance,
+# security group, keypair. Every step is safe to re-run.
+# ===========================================================================
+
+- name: Tear down the StrongDM proxy worker demo
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vault.yml
+
+  tasks:
+
+    - name: Confirm intent
+      ansible.builtin.pause:
+        prompt: |
+
+          This will DESTROY:
+            - EC2 instances tagged Project=strongdm-ansible-demo in {{ aws_region }}
+            - the "{{ worker_name }}-sg" security group and its Elastic IP
+            - the "{{ ssh_key_name }}" EC2 keypair
+            - the "{{ sdm_cluster_name }}" proxy cluster in StrongDM
+
+          Press ENTER to continue, or Ctrl-C then A to abort
+      when: not (auto_approve | default(false) | bool)
+
+    # -- StrongDM ----------------------------------------------------------
+
+    - name: Find the proxy cluster in StrongDM
+      ansible.builtin.command:
+        cmd: sdm admin nodes list --filter "name:{{ sdm_cluster_name }}"
+      environment:
+        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      register: cluster_list
+      changed_when: false
+      failed_when: false
+
+    - name: Extract the proxy cluster id
+      vars:
+        _id_matches: "{{ cluster_list.stdout | default('') | regex_findall('plc-[0-9a-zA-Z]+') }}"
+      ansible.builtin.set_fact:
+        cluster_id: "{{ _id_matches[0] if _id_matches | length > 0 else '' }}"
+
+    - name: Delete the proxy cluster
+      ansible.builtin.command:
+        cmd: sdm admin nodes delete {{ cluster_id }}
+      environment:
+        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      register: cluster_delete
+      changed_when: cluster_delete.rc == 0
+      failed_when: false
+      when: cluster_id | length > 0
+
+    - name: Note if the cluster needs manual cleanup
+      ansible.builtin.debug:
+        msg: >-
+          No proxy cluster id found for "{{ sdm_cluster_name }}". If one exists,
+          remove it in the Admin UI under Networking > Proxy Clusters.
+      when: cluster_id | length == 0
+
+    # -- AWS ---------------------------------------------------------------
+
+    - name: Find the demo instances
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": strongdm-ansible-demo
+          instance-state-name:
+            - running
+            - stopped
+            - stopping
+            - pending
+      register: demo_instances
+
+    - name: Release the Elastic IP
+      amazon.aws.ec2_eip:
+        region: "{{ aws_region }}"
+        device_id: "{{ item.instance_id }}"
+        in_vpc: true
+        release_on_disassociation: true
+        state: absent
+      loop: "{{ demo_instances.instances }}"
+      loop_control:
+        label: "{{ item.instance_id }}"
+      failed_when: false
+
+    - name: Terminate the demo instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids: "{{ demo_instances.instances | map(attribute='instance_id') | list }}"
+        state: absent
+        wait: true
+        wait_timeout: 600
+      when: demo_instances.instances | length > 0
+
+    # The security group cannot be deleted while an ENI still references it,
+    # and termination releases those asynchronously.
+    - name: Delete the security group
+      amazon.aws.ec2_security_group:
+        region: "{{ aws_region }}"
+        name: "{{ worker_name }}-sg"
+        state: absent
+      register: sg_delete
+      retries: 10
+      delay: 15
+      until: sg_delete is succeeded
+
+    - name: Delete the EC2 keypair
+      amazon.aws.ec2_key:
+        region: "{{ aws_region }}"
+        name: "{{ ssh_key_name }}"
+        state: absent
+
+    - name: Teardown complete
+      ansible.builtin.debug:
+        msg:
+          - "AWS resources removed."
+          - "Local SSH key left in place at {{ ssh_key_path }} - delete it manually if you want."

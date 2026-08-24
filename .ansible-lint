@@ -1,0 +1,13 @@
+---
+profile: production
+
+exclude_paths:
+  - .venv/
+  - collections/
+  - .ansible/
+
+skip_list:
+  # run-once[task] warns that run_once behaves unpredictably under the "free"
+  # strategy. The play that uses run_once pins `strategy: linear` explicitly,
+  # so the condition the rule guards against cannot occur here.
+  - run-once[task]

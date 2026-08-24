@@ -1,0 +1,35 @@
+---
+# Dynamic inventory for re-running the playbook against an already-provisioned
+# worker, and for ad-hoc checks:
+#
+#   ansible-inventory --graph
+#   ansible sdm_workers -m command -a 'systemctl is-active sdm-worker' -b
+#
+# The first run of site.yml does not need this file: it provisions the instance
+# and adds it to the in-memory inventory via add_host.
+plugin: amazon.aws.aws_ec2
+
+regions:
+  - us-east-2
+
+filters:
+  "tag:Project": strongdm-ansible-demo
+  instance-state-name:
+    - running
+
+# Reach the worker over its private IP. The control node lives in the same VPC,
+# so this keeps SSH off the public interface.
+hostnames:
+  - private-ip-address
+
+keyed_groups:
+  - key: tags.Project
+    prefix: project
+    separator: _
+
+groups:
+  sdm_workers: "'strongdm-ansible-demo' == tags.get('Project', '')"
+
+compose:
+  ansible_user: "'ec2-user'"
+  ansible_ssh_private_key_file: "'~/.ssh/sdm-ansible-demo'"

@@ -1,0 +1,100 @@
+---
+# ============================================================================
+# Non-secret configuration. Secrets live in vault.yml (see vault.yml.example).
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# AWS
+# ---------------------------------------------------------------------------
+aws_region: us-east-2
+
+# Leave vpc_id / subnet_id empty to use the account's default VPC and the
+# first available subnet in it. Set them explicitly for a non-default VPC.
+vpc_id: ""
+subnet_id: ""
+
+# t3.medium == 2 vCPU / 4 GB, which is StrongDM's documented minimum for a
+# proxy worker. Do not go smaller for production, small is fine for a demo.
+instance_type: t3.small
+root_volume_gb: 8
+
+# Name tag / hostname for the worker instance.
+worker_name: sdm-proxy-worker-01
+
+# Tags applied to every AWS resource this playbook creates. The teardown
+# playbook uses these to find what to destroy, so keep them consistent.
+resource_tags:
+  Name: "{{ worker_name }}"
+  Project: strongdm-ansible-demo
+  ManagedBy: ansible
+  Owner: david.chase@delinea.com
+  Environment: sandbox
+
+# ---------------------------------------------------------------------------
+# Network access
+# ---------------------------------------------------------------------------
+# CIDRs allowed to reach the proxy worker on its client-facing port.
+# 0.0.0.0/0 is acceptable for a throwaway sandbox because the worker requires
+# mutual TLS with a StrongDM-issued client certificate. Narrow it anyway if
+# your sandbox account has guardrails that object.
+client_ingress_cidrs:
+  - 0.0.0.0/0
+
+# CIDR allowed to SSH to the worker. Defaults to the control node's own
+# private IP, discovered at runtime. Override only if you need to.
+ssh_ingress_cidrs: []
+
+# ---------------------------------------------------------------------------
+# SSH
+# ---------------------------------------------------------------------------
+ssh_key_name: sdm-ansible-demo
+ssh_key_path: "~/.ssh/{{ ssh_key_name }}"
+remote_user: ec2-user
+
+# ---------------------------------------------------------------------------
+# StrongDM
+# ---------------------------------------------------------------------------
+# Control plane region. Use app.uk.strongdm.com or app.eu.strongdm.com if your
+# org's control plane lives there. This is the CONTROL PLANE region, not your
+# own location. Default for most orgs is US.
+sdm_app_domain: app.strongdm.com
+
+# Human-readable name for the proxy cluster created in StrongDM.
+sdm_cluster_name: dc-ansible-cluster
+
+# Port the worker binds for client traffic.
+#
+#   443  - single-worker sandbox cluster, clients connect directly. What this
+#          demo uses, and what StrongDM's single-worker guide documents.
+#   8443 - StrongDM's production recommendation: workers bind high, and a
+#          network load balancer remaps 443 -> 8443 across the fleet.
+#
+# Binding below 1024 needs root, which is why the install task uses become.
+sdm_worker_bind_port: 443
+
+# Where the sdm binary and its systemd environment file end up. These paths are
+# what StrongDM's installer uses; changing them will break `systemctl`.
+sdm_env_file: /etc/sysconfig/sdm-worker
+sdm_service_name: sdm-worker
+sdm_download_dir: /opt/strongdm
+
+# If your sandbox egresses through a corporate proxy, set these and they will
+# be written into the worker's systemd environment file.
+sdm_http_proxy: ""
+sdm_https_proxy: ""
+sdm_no_proxy: ""
+
+# Set true to pin the worker at its installed version instead of letting it
+# self-upgrade during the daily maintenance window. Handy if you are demoing
+# and do not want a surprise restart.
+sdm_disable_update: false
+
+# ---------------------------------------------------------------------------
+# Escape hatch
+# ---------------------------------------------------------------------------
+# Normally the playbook creates the proxy cluster and mints its authentication
+# key for you. If you would rather create the cluster in the Admin UI and paste
+# the key pair in, set these two in vault.yml and the playbook will skip
+# cluster creation entirely. See README "Bring your own cluster".
+sdm_proxy_cluster_access_key: ""
+sdm_proxy_cluster_secret_key: ""
