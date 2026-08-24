@@ -39,8 +39,10 @@
           then encrypt it with `ansible-vault encrypt vault.yml`.
         quiet: true
 
+    # --version is a global flag on the sdm binary, not a subcommand.
+    # `sdm version` exits 3 with "No help topic for 'version'".
     - name: Assert that the sdm CLI is present on the control node
-      ansible.builtin.command: sdm version
+      ansible.builtin.command: sdm --version
       register: sdm_version
       changed_when: false
       failed_when: sdm_version.rc != 0
@@ -275,7 +277,7 @@
 
     - name: Check whether the proxy cluster already exists
       ansible.builtin.command:
-        cmd: sdm admin nodes list --filter "name:{{ sdm_cluster_name }}"
+        cmd: sdm admin nodes list --json --filter "name:{{ sdm_cluster_name }}"
       environment:
         SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
         SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
@@ -286,6 +288,14 @@
       changed_when: false
       failed_when: false
       no_log: true
+
+    # Without this, a second run would create a duplicate cluster in StrongDM -
+    # the worker install is idempotent but cluster creation was not.
+    - name: Record whether that cluster is already present
+      ansible.builtin.set_fact:
+        cluster_exists: >-
+          {{ sdm_cluster_name in (existing_cluster.stdout | default('')) }}
+      run_once: true
 
     - name: Decide whether a key pair was supplied
       ansible.builtin.set_fact:
@@ -308,7 +318,9 @@
       run_once: true
       register: cluster_create
       changed_when: cluster_create.rc == 0
-      when: not byo_cluster | bool
+      when:
+        - not byo_cluster | bool
+        - not cluster_exists | bool
       no_log: true
 
     # `create-proxy-cluster` prints the cluster's first authentication key on
@@ -326,7 +338,9 @@
         parsed_access_key: "{{ _access_matches[0] if _access_matches | length > 0 else '' }}"
         parsed_secret_key: "{{ _secret_matches[0] if _secret_matches | length > 0 else '' }}"
       run_once: true
-      when: not byo_cluster | bool
+      when:
+        - not byo_cluster | bool
+        - not cluster_exists | bool
       no_log: true
 
     - name: Settle on the credentials the worker will use
@@ -342,9 +356,18 @@
     - name: Fail with guidance if no key pair could be obtained
       ansible.builtin.fail:
         msg: |
-          Could not determine the proxy cluster authentication key pair.
+          No proxy cluster authentication key pair is available.
 
-          The cluster may still have been created. Finish manually:
+          {% if cluster_exists | bool %}
+          The cluster "{{ sdm_cluster_name }}" already exists, so this run did
+          not create one - and there is no CLI command to mint a key for an
+          existing cluster.
+          {% else %}
+          The cluster may still have been created; the key pair just could not
+          be parsed out of the CLI output.
+          {% endif %}
+
+          Finish manually:
 
             1. StrongDM Admin UI > Networking > Proxy Clusters
             2. Open "{{ sdm_cluster_name }}" > Keys tab > Add authentication key

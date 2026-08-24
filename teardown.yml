@@ -33,39 +33,25 @@
 
     # -- StrongDM ----------------------------------------------------------
 
-    - name: Find the proxy cluster in StrongDM
-      ansible.builtin.command:
-        cmd: sdm admin nodes list --filter "name:{{ sdm_cluster_name }}"
-      environment:
-        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
-        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
-      register: cluster_list
-      changed_when: false
-      failed_when: false
-
-    - name: Extract the proxy cluster id
-      vars:
-        _id_matches: "{{ cluster_list.stdout | default('') | regex_findall('plc-[0-9a-zA-Z]+') }}"
-      ansible.builtin.set_fact:
-        cluster_id: "{{ _id_matches[0] if _id_matches | length > 0 else '' }}"
-
+    # `sdm admin nodes delete` accepts ID|NAME, so the cluster name is enough -
+    # no need to scrape an ID out of the list output.
     - name: Delete the proxy cluster
       ansible.builtin.command:
-        cmd: sdm admin nodes delete {{ cluster_id }}
+        cmd: sdm admin nodes delete {{ sdm_cluster_name }}
       environment:
         SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
         SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
       register: cluster_delete
       changed_when: cluster_delete.rc == 0
       failed_when: false
-      when: cluster_id | length > 0
 
     - name: Note if the cluster needs manual cleanup
       ansible.builtin.debug:
         msg: >-
-          No proxy cluster id found for "{{ sdm_cluster_name }}". If one exists,
-          remove it in the Admin UI under Networking > Proxy Clusters.
-      when: cluster_id | length == 0
+          Could not delete proxy cluster "{{ sdm_cluster_name }}"
+          (rc={{ cluster_delete.rc }}). It may already be gone. If it still
+          exists, remove it in the Admin UI under Networking > Proxy Clusters.
+      when: cluster_delete.rc != 0
 
     # -- AWS ---------------------------------------------------------------
 

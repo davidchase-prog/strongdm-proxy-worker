@@ -217,7 +217,7 @@ error page to disk, so the `ls` either shows you a real zip or you stop there.
 
 ```bash
 # Verify all three
-ansible --version && sdm version && aws sts get-caller-identity
+ansible --version && sdm --version && aws sts get-caller-identity
 ```
 
 That last command should show the instance-profile role ARN. If it errors,
@@ -482,7 +482,11 @@ The venv isn't active in this shell. Run
 `source ~/.venv/ansible/bin/activate`. The `.bashrc` line added in 1.5 covers
 future logins but not the shell that created it.
 
-**`sdm version` not found on the control node**
+**`No help topic for 'version'` (rc 3)**
+`--version` is a global flag on the `sdm` binary, not a subcommand. Use
+`sdm --version`.
+
+**`sdm: command not found` on the control node**
 `/usr/local/bin` missing from `PATH`, or step 1.5 didn't complete. Re-run the
 `install -m 0755` line.
 
