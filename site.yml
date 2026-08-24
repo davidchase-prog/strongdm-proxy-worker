@@ -52,38 +52,47 @@
         msg: "Control node sdm CLI: {{ sdm_version.stdout | trim }}"
 
     # -- Network lookups ---------------------------------------------------
-    # Resolve the default VPC and a subnet unless the operator pinned them in
-    # group_vars. Keeping this dynamic is what makes the demo reproducible in
-    # any sandbox account without editing variables first.
+    # Resolve the subnet, and take the VPC id from whatever subnet we land on.
+    #
+    # Deliberately NOT using ec2_vpc_net_info: that module calls
+    # DescribeVpcAttribute to report DNS settings we never read, which needs an
+    # extra IAM permission for no benefit. DescribeSubnets alone tells us both
+    # the subnet and its VPC.
+    #
+    # Filter precedence:
+    #   subnet_id set          -> use exactly that subnet
+    #   vpc_id set             -> first available subnet in that VPC
+    #   neither set            -> first default-for-AZ subnet (the default VPC)
 
-    - name: Look up the default VPC
-      amazon.aws.ec2_vpc_net_info:
-        region: "{{ aws_region }}"
-        filters:
-          isDefault: "true"
-      register: default_vpc
-      when: vpc_id | length == 0
-
-    - name: Set the target VPC
-      ansible.builtin.set_fact:
-        target_vpc_id: >-
-          {{ vpc_id if vpc_id | length > 0
-             else (default_vpc.vpcs | first).vpc_id }}
-
-    - name: Look up subnets in the target VPC
+    - name: Resolve the target subnet
       amazon.aws.ec2_vpc_subnet_info:
         region: "{{ aws_region }}"
-        filters:
-          vpc-id: "{{ target_vpc_id }}"
-          state: available
+        filters: "{{ _subnet_filters }}"
+      vars:
+        _subnet_filters: >-
+          {{ {'state': 'available'}
+             | combine({'subnet-id': subnet_id} if subnet_id | length > 0 else {})
+             | combine({'vpc-id': vpc_id} if vpc_id | length > 0 else {})
+             | combine({'default-for-az': 'true'}
+                       if (subnet_id | length == 0 and vpc_id | length == 0) else {}) }}
       register: vpc_subnets
-      when: subnet_id | length == 0
 
-    - name: Set the target subnet
+    - name: Assert that a usable subnet was found
+      ansible.builtin.assert:
+        that:
+          - vpc_subnets.subnets | length > 0
+        fail_msg: >-
+          No available subnet found in {{ aws_region }}. If this account has no
+          default VPC, set vpc_id and subnet_id explicitly in group_vars/all.yml.
+        quiet: true
+
+    - name: Set the target network
       ansible.builtin.set_fact:
-        target_subnet_id: >-
-          {{ subnet_id if subnet_id | length > 0
-             else (vpc_subnets.subnets | sort(attribute='availability_zone') | first).subnet_id }}
+        target_subnet_id: "{{ _chosen_subnet.subnet_id }}"
+        target_vpc_id: "{{ _chosen_subnet.vpc_id }}"
+      vars:
+        _chosen_subnet: >-
+          {{ vpc_subnets.subnets | sort(attribute='availability_zone') | first }}
 
     - name: Report the resolved network
       ansible.builtin.debug:
