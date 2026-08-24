@@ -249,7 +249,13 @@
     - name: Add the worker to the in-memory inventory
       ansible.builtin.add_host:
         name: "{{ worker_name }}"
-        groups: sdm_workers
+        # Deliberately NOT sdm_workers. The aws_ec2 dynamic inventory also
+        # builds sdm_workers from the Project tag, and those hosts carry none of
+        # the facts below - so a play targeting sdm_workers would pick up an
+        # inventory-derived host (named by private IP) and fail on
+        # 'worker_advertised_address is undefined'. This group has exactly one
+        # member: the instance this run just provisioned.
+        groups: sdm_worker_target
         ansible_host: "{{ worker_private_ip }}"
         ansible_user: "{{ remote_user }}"
         ansible_ssh_private_key_file: "{{ ssh_key_path | expanduser }}"
@@ -270,7 +276,7 @@
 # ===========================================================================
 
 - name: Create the proxy cluster and install the worker
-  hosts: sdm_workers
+  hosts: sdm_worker_target
   gather_facts: true
   become: true
   # Stated explicitly because the cluster-creation tasks below use run_once,
@@ -286,6 +292,20 @@
         state: restarted
 
   tasks:
+
+    # Fail fast and legibly if this play was reached without Play 1's facts -
+    # e.g. by running with `--limit` or targeting the group by hand.
+    - name: Assert that the provisioning facts arrived from play 1
+      ansible.builtin.assert:
+        that:
+          - worker_advertised_address is defined
+          - worker_public_ip is defined
+          - worker_private_ip is defined
+        fail_msg: >-
+          Provisioning facts are missing. This play must run as part of
+          site.yml, which sets them in play 1 via add_host. Run
+          `ansible-playbook site.yml` rather than targeting this play directly.
+        quiet: true
 
     # -- Create the cluster in StrongDM ------------------------------------
     # Runs on the control node (delegate_to: localhost) because that is where
