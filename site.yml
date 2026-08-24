@@ -119,12 +119,11 @@
         state: present
 
     # -- Security group ----------------------------------------------------
-    # Two rules only:
+    # Two ingress rules only:
     #   443 from client CIDRs  -> StrongDM clients connecting to the worker
     #   22  from control node  -> Ansible itself
-    # Everything the worker needs outbound (app.strongdm.com,
-    # downloads.strongdm.com, and the resources it proxies) rides the default
-    # allow-all egress rule.
+    # Egress is left as AWS creates it (allow all), which covers
+    # app.strongdm.com, downloads.strongdm.com, and the proxied resources.
 
     - name: Create the proxy worker security group
       amazon.aws.ec2_security_group:
@@ -146,10 +145,19 @@
               {{ ssh_ingress_cidrs if ssh_ingress_cidrs | length > 0
                  else [ansible_default_ipv4.address ~ '/32'] }}
             rule_desc: "SSH from the Ansible control node"
-        rules_egress:
-          - proto: all
-            cidr_ip: 0.0.0.0/0
-            rule_desc: "Worker egress to StrongDM control plane and resources"
+        # No rule_desc on the egress rule, and no purge.
+        #
+        # AWS creates an allow-all egress rule automatically with every new
+        # security group. Supplying a description here makes the module call
+        # UpdateSecurityGroupRuleDescriptionsEgress against that pre-existing
+        # -1/all-protocol rule, which AWS rejects with "Failed to update
+        # security group rule descriptions egress". It reads like a permissions
+        # error and is not one.
+        #
+        # Egress is left exactly as AWS created it: all protocols, all
+        # destinations - which is what the worker needs to reach
+        # app.strongdm.com, downloads.strongdm.com, and the resources it proxies.
+        purge_rules_egress: false
         state: present
       register: worker_sg
 
