@@ -83,6 +83,17 @@ Created in StrongDM:
 > uname -s      # Linux              (not Darwin)
 > ```
 >
+> **The fastest tell is the error prefix.** macOS uses zsh, Amazon Linux uses
+> bash, so a missing command names the shell that failed:
+>
+> | Error you see | Where you are |
+> |---|---|
+> | `zsh: command not found: ansible-vault` | Your Mac — wrong tab |
+> | `bash: ansible-vault: command not found` | The instance — real problem |
+>
+> On the instance, that second one usually just means the venv isn't active:
+> `source ~/.venv/ansible/bin/activate`
+>
 > That separation is deliberate. The control node exists precisely so you don't
 > need admin rights, Homebrew, or a security exception on a managed laptop.
 
@@ -230,18 +241,38 @@ to paste, nothing to leave behind when you terminate it.
 
 ### 2.1 StrongDM admin token
 
-Admin UI → **Settings → Admin Tokens** → create a token. Then:
+Admin UI → **Settings → Admin Tokens** → create a token.
+
+On the control node, start from the example file:
 
 ```bash
 cp vault.yml.example vault.yml
-$EDITOR vault.yml          # paste the token into sdm_admin_token
+```
 
-# Vault password, referenced by ansible.cfg
+Set the token without it landing in your shell history — `read -rs` doesn't echo,
+and the token never appears as a command argument:
+
+```bash
+read -rs -p "StrongDM admin token: " SDM_TOKEN && echo
+sed -i "s|^sdm_admin_token:.*|sdm_admin_token: \"$SDM_TOKEN\"|" vault.yml && unset SDM_TOKEN
+
+grep -q '^sdm_admin_token: "REPLACE_ME"' vault.yml && echo "NOT SET" || echo "token set"
+```
+
+The `^sdm_admin_token:` anchor matters. A plain `s/REPLACE_ME/…/g` would also
+match the commented-out `sdm_proxy_cluster_secret_key` line and leave your token
+sitting in a comment. (`vi vault.yml` works too, if you prefer an editor.)
+
+Then create the vault password and encrypt:
+
+```bash
 openssl rand -base64 32 > ~/.ansible-vault-pass
 chmod 600 ~/.ansible-vault-pass
 
 ansible-vault encrypt vault.yml
 ```
+
+No password prompt — `ansible.cfg` already points at `~/.ansible-vault-pass`.
 
 ### 2.2 Review the variables
 
@@ -441,6 +472,15 @@ writable. Check with `pwd && id -un` — if it says `/usr/bin` and `ssm-user`, r
 The download didn't produce a zip. Either `curl` wrote an error page instead of
 the file — re-run it with `-f` so it fails loudly — or `unzip` isn't installed
 yet (`sudo dnf install -y unzip`).
+
+**`zsh: command not found: ansible-vault` (or ansible-playbook, sdm, aws)**
+You're on your Mac. macOS uses zsh; the instance uses bash. None of the Part 2
+or Part 3 commands run locally — switch to the Session Manager tab.
+
+**`bash: ansible-vault: command not found` on the instance**
+The venv isn't active in this shell. Run
+`source ~/.venv/ansible/bin/activate`. The `.bashrc` line added in 1.5 covers
+future logins but not the shell that created it.
 
 **`sdm version` not found on the control node**
 `/usr/local/bin` missing from `PATH`, or step 1.5 didn't complete. Re-run the

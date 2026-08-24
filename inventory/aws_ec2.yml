@@ -22,13 +22,15 @@ filters:
 hostnames:
   - private-ip-address
 
+# Use ec2_tags, not tags. The bare `tags` host variable is deprecated and is
+# being removed from amazon.aws after 2026-12-01.
 keyed_groups:
-  - key: tags.Project
+  - key: ec2_tags.Project
     prefix: project
     separator: _
 
 groups:
-  sdm_workers: "'strongdm-ansible-demo' == tags.get('Project', '')"
+  sdm_workers: "'strongdm-ansible-demo' == ec2_tags.get('Project', '')"
 
 compose:
   ansible_user: "'ec2-user'"
