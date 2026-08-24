@@ -59,7 +59,7 @@ Resources created in AWS, all tagged `Project=strongdm-ansible-demo`:
 
 Created in StrongDM:
 
-- a proxy cluster named `ansible-demo-cluster` advertising `<EIP>:443`
+- a proxy cluster named `dc-ansible-cluster` advertising `<EIP>:443`
 - one authentication key pair for that cluster
 
 ---
@@ -215,10 +215,14 @@ the instance profile isn't attached — fix that before continuing.
 ### 1.6 Get the playbook onto the box
 
 ```bash
-git clone <your-repo-url> strongdm-proxy-worker
+cd ~
+git clone https://github.com/davidchase-prog/strongdm-proxy-worker.git
 cd strongdm-proxy-worker
 ansible-galaxy collection install -r requirements.yml
 ```
+
+The repo is public, so the clone needs no credentials on the instance — nothing
+to paste, nothing to leave behind when you terminate it.
 
 ---
 
@@ -248,7 +252,7 @@ you're most likely to touch:
 |---|---|---|
 | `aws_region` | `us-east-2` | Must match the IAM policy condition (1.1) |
 | `sdm_app_domain` | `app.strongdm.com` | Change for a UK or EU **control plane** |
-| `sdm_cluster_name` | `ansible-demo-cluster` | Name shown in the Admin UI |
+| `sdm_cluster_name` | `dc-ansible-cluster` | Name shown in the Admin UI |
 | `sdm_worker_bind_port` | `443` | Use `8443` behind a load balancer |
 | `client_ingress_cidrs` | `0.0.0.0/0` | Narrow it if your sandbox has guardrails |
 | `vpc_id` / `subnet_id` | empty | Empty means default VPC, auto-discovered |
@@ -274,7 +278,7 @@ TASK [Done]
 ok: [sdm-proxy-worker-01] =>
   msg:
   - Proxy worker installed natively via binary + systemd.
-  - 'Cluster:    ansible-demo-cluster'
+  - 'Cluster:    dc-ansible-cluster'
   - 'Advertised: 54.x.x.x:443'
   - 'Service:    sdm-worker (active)'
   - 'Probe:      HTTP 404 (404 = healthy)'
