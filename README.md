@@ -595,9 +595,10 @@ a transient value:
 
 1. On the first run it creates the cluster and parses the pair out of the CLI
    output.
-2. It writes the pair to `credentials/<cluster>.yml` and encrypts it in place
-   with `ansible-vault`, using the same `~/.ansible-vault-pass` that
-   `ansible.cfg` already points at. Nothing extra to manage.
+2. It writes the pair to a `.staging` file, encrypts that with `ansible-vault`,
+   and only then moves it to `credentials/<cluster>.yml` — so the final path
+   only ever exists encrypted. Same `~/.ansible-vault-pass` that `ansible.cfg`
+   already points at; nothing extra to manage.
 3. This happens **before any instance is launched**, so a failure later in the
    run leaves the credentials intact and the next run is a resume, not a
    restart.
@@ -642,6 +643,34 @@ ansible-playbook site.yml
 
 Existing workers don't need rebuilding. The re-run rewrites the key pair in
 `/etc/sysconfig/sdm-worker` and restarts the service.
+
+### Why staging, and the vault-id trap
+
+Two non-obvious things live in that step.
+
+**`copy` writes plaintext and `ansible-vault` encrypts in a second pass**, so the
+secret is briefly unencrypted on disk no matter how it's arranged. Writing
+straight to the final path made that window permanent on failure: the next run
+found the cleartext file, read it happily — `include_vars` neither knows nor
+cares whether a file is encrypted — set `credentials_already_stored`, and skipped
+the encrypt step forever. A crash silently downgraded a live secret to plaintext
+and nothing ever said so. Staging plus an `always` cleanup means a failure leaves
+nothing readable behind, and a separate guard refuses to load an unencrypted
+credentials file at all.
+
+**`--encrypt-vault-id default` is required**, which reads like noise and isn't.
+`ansible.cfg` sets `vault_password_file`, and the task passes
+`--vault-password-file` too so it doesn't depend on the invoking directory. That
+leaves `ansible-vault` holding two secrets both labelled `default`, and rather
+than notice they're identical it refuses to choose:
+
+```
+ERROR! The vault-ids default,default are available to encrypt.
+Specify the vault-id to encrypt with --encrypt-vault-id
+```
+
+Naming the id resolves it, and the output decrypts through the normal path with
+no special handling.
 
 ### Back it up
 

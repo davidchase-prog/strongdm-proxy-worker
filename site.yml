@@ -125,9 +125,42 @@
         path: "{{ sdm_credentials_file }}"
       register: stored_creds
 
-    # include_vars decrypts vault-encrypted files transparently, so the stored
-    # file needs no special handling here. `name:` keeps its keys in their own
-    # namespace instead of colliding with anything already defined.
+    # include_vars reads an encrypted file and a plaintext one equally happily,
+    # which is convenient and also means it will never tell you the secret is
+    # sitting in cleartext. Checked explicitly, because a file that lost its
+    # encryption is a problem to be surfaced rather than tolerated.
+    - name: Check that the stored credentials are encrypted
+      ansible.builtin.command:
+        cmd: head -c 15 {{ sdm_credentials_file }}
+      register: creds_header
+      changed_when: false
+      when: stored_creds.stat.exists
+
+    - name: Fail if the stored credentials are not encrypted
+      ansible.builtin.fail:
+        msg: |
+          credentials/{{ sdm_cluster_name }}.yml is NOT encrypted — it starts
+          with plaintext rather than $ANSIBLE_VAULT.
+
+          A live cluster secret is sitting on disk in the clear. Almost always
+          this is the wreckage of an earlier run that wrote the file and then
+          failed before encrypting it.
+
+          The credentials themselves are probably fine. Encrypt in place and
+          re-run:
+
+            ansible-vault encrypt credentials/{{ sdm_cluster_name }}.yml
+            ansible-playbook site.yml
+
+          If you would rather start clean, delete the file — but note the
+          cluster may already exist, in which case you will be prompted for a
+          fresh key pair from the Admin UI.
+      when:
+        - stored_creds.stat.exists
+        - not (creds_header.stdout | default('')) is search('ANSIBLE_VAULT')
+
+    # `name:` keeps the stored keys in their own namespace instead of colliding
+    # with anything already defined.
     - name: Load the stored credentials
       ansible.builtin.include_vars:
         file: "{{ sdm_credentials_file }}"
@@ -668,6 +701,17 @@
     # Written the instant the pair is known, before any instance is launched.
     # If a later step blows up, the credentials survive and the next run is a
     # resume rather than a restart.
+    #
+    # Staged, then encrypted, then moved — so the final path only ever exists in
+    # its encrypted form.
+    #
+    # `copy` writes plaintext and `ansible-vault` encrypts in a second step, so
+    # the secret is briefly unencrypted on disk no matter what. Writing straight
+    # to the final path made that brief window permanent on failure: the next run
+    # would find the cleartext file, read it happily (include_vars neither knows
+    # nor cares whether a file is encrypted), set credentials_already_stored, and
+    # skip the encrypt step forever. A crash would silently downgrade a live
+    # secret to plaintext and nothing would ever say so.
 
     - name: Create the credentials directory
       ansible.builtin.file:
@@ -676,48 +720,80 @@
         mode: "0700"
       when: not credentials_already_stored | bool
 
-    - name: Write the cluster credentials
-      ansible.builtin.copy:
-        dest: "{{ sdm_credentials_file }}"
-        mode: "0600"
-        content: |
-          ---
-          # StrongDM proxy cluster credentials — {{ sdm_cluster_name }}
-          #
-          # Written by site.yml on {{ ansible_date_time.iso8601 }} and encrypted
-          # with ansible-vault. Every worker in this cluster authenticates with
-          # this pair, and StrongDM will not show it again — so this file is the
-          # only copy. Back it up somewhere your team can reach.
-          #
-          # Read back automatically on the next run; nothing to do by hand.
-          sdm_cluster_name: {{ sdm_cluster_name }}
-          sdm_cluster_address: {{ cluster_address }}
-          sdm_cluster_access_key: "{{ cluster_access_key }}"
-          sdm_cluster_secret_key: "{{ cluster_secret_key }}"
-      no_log: true
+    - name: Store the cluster credentials, encrypted
       when: not credentials_already_stored | bool
+      block:
 
-    # copy writes plaintext, so encrypt in place immediately after. The
-    # password file is passed explicitly rather than left to ansible.cfg, so
-    # this works regardless of the directory the playbook was invoked from.
-    - name: Encrypt the credentials file
-      ansible.builtin.command:
-        argv:
-          - ansible-vault
-          - encrypt
-          - --vault-password-file
-          - "{{ sdm_vault_password_file | expanduser }}"
-          - "{{ sdm_credentials_file }}"
-      changed_when: true
-      when: not credentials_already_stored | bool
+        - name: Write the cluster credentials to a staging file
+          ansible.builtin.copy:
+            dest: "{{ sdm_credentials_file }}.staging"
+            mode: "0600"
+            content: |
+              ---
+              # StrongDM proxy cluster credentials — {{ sdm_cluster_name }}
+              #
+              # Written by site.yml on {{ ansible_date_time.iso8601 }} and
+              # encrypted with ansible-vault. Every worker in this cluster
+              # authenticates with this pair, and StrongDM will not show it
+              # again — so this file is the only copy. Back it up somewhere your
+              # team can reach.
+              #
+              # Read back automatically on the next run; nothing to do by hand.
+              sdm_cluster_name: {{ sdm_cluster_name }}
+              sdm_cluster_address: {{ cluster_address }}
+              sdm_cluster_access_key: "{{ cluster_access_key }}"
+              sdm_cluster_secret_key: "{{ cluster_secret_key }}"
+          no_log: true
 
-    - name: Confirm the credentials are stored
-      ansible.builtin.debug:
-        msg: >-
-          Cluster credentials encrypted to
-          credentials/{{ sdm_cluster_name }}.yml. Keep it — adding a worker
-          later depends on it, and StrongDM cannot reissue this key pair.
-      when: not credentials_already_stored | bool
+        # --encrypt-vault-id is not optional here, and the reason is unobvious.
+        #
+        # ansible.cfg already sets vault_password_file, and this task passes
+        # --vault-password-file as well so it works regardless of the invoking
+        # directory. That leaves ansible-vault holding two secrets both labelled
+        # `default`, and rather than notice they are identical it refuses to
+        # choose:
+        #
+        #   ERROR! The vault-ids default,default are available to encrypt.
+        #   Specify the vault-id to encrypt with --encrypt-vault-id
+        #
+        # Naming the id resolves it, and the result decrypts through the normal
+        # path with no special handling. Keeping the explicit password file is
+        # still worth it — without it this step depends on cwd.
+        - name: Encrypt the staged credentials file
+          ansible.builtin.command:
+            argv:
+              - ansible-vault
+              - encrypt
+              - --vault-password-file
+              - "{{ sdm_vault_password_file | expanduser }}"
+              - --encrypt-vault-id
+              - default
+              - "{{ sdm_credentials_file }}.staging"
+          changed_when: true
+
+        - name: Move the encrypted credentials into place
+          ansible.builtin.command:
+            argv:
+              - mv
+              - -f
+              - "{{ sdm_credentials_file }}.staging"
+              - "{{ sdm_credentials_file }}"
+          changed_when: true
+
+        - name: Confirm the credentials are stored
+          ansible.builtin.debug:
+            msg: >-
+              Cluster credentials encrypted to
+              credentials/{{ sdm_cluster_name }}.yml. Keep it — adding a worker
+              later depends on it, and StrongDM cannot reissue this key pair.
+
+      always:
+        # A no-op on success, the file having been moved. On failure it removes
+        # the only plaintext copy, which is the entire point.
+        - name: Remove the staging file
+          ansible.builtin.file:
+            path: "{{ sdm_credentials_file }}.staging"
+            state: absent
 
     # Guards against the specific failure of pointing a rebuilt load balancer
     # at an existing cluster: the address changed, the cluster's did not, and
@@ -1090,8 +1166,19 @@
           n=$(grep -c '^SDM_PROXY_CLUSTER_SECRET_KEY=' {{ sdm_env_file }})
           [ "$n" -eq 1 ] || { echo "expected 1 secret key line, found $n" >&2; exit 1; }
           v=$(grep -m1 '^SDM_PROXY_CLUSTER_SECRET_KEY=' {{ sdm_env_file }} | cut -d= -f2-)
+          # Length via wc, and NOT via the shell's own string-length expansion.
+          # Ansible templates this block before bash ever sees it, and that
+          # expansion's brace-hash opening sequence is also how Jinja opens a
+          # comment — so it swallows the rest of the script looking for a close
+          # and fails the task with "Missing end of comment tag". The error
+          # names neither bash nor the offending characters.
+          #
+          # Do not write that sequence anywhere in this block, comments
+          # included. Jinja scans the whole string; it has no idea which parts
+          # bash would treat as a comment.
+          len=$(printf '%s' "$v" | wc -c)
           printf '%s' "$v" | base64 -d > /dev/null \
-            || { echo "secret key is not valid base64 (length ${#v})" >&2; exit 1; }
+            || { echo "secret key is not valid base64 (length $len)" >&2; exit 1; }
           grep -qE '^SDM_PROXY_CLUSTER_ACCESS_KEY=pk-[0-9a-zA-Z]{8,}$' {{ sdm_env_file }} \
             || { echo "access key line is missing or malformed" >&2; exit 1; }
         executable: /bin/bash
