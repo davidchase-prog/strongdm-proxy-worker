@@ -10,11 +10,15 @@
 # StrongDM cluster, then EIPs, instances, security group, keypair. Every step
 # is safe to re-run.
 #
-# The encrypted credentials file is kept by default. Once the cluster is
-# deleted the key pair is worthless, but deleting the wrong file is
-# unrecoverable — so removing it is opt-in:
+# The encrypted credentials file goes with the cluster. Deleting the cluster
+# invalidates the key pair, so keeping the file leaves a loaded gun on the
+# floor: the next site.yml run would find it, take it as proof the cluster
+# exists, skip creation, and hand every worker keys nothing accepts.
 #
-#   ansible-playbook teardown.yml -e delete_credentials=true
+# site.yml now detects that and refuses to continue, but the right fix is not to
+# create the situation. To keep the file anyway:
+#
+#   ansible-playbook teardown.yml -e keep_credentials=true
 # ===========================================================================
 
 - name: Tear down a StrongDM proxy cluster and its workers
@@ -60,12 +64,13 @@
             - the "{{ worker_sg_name }}" security group
             - the "{{ ssh_key_name }}" EC2 keypair
             - the "{{ sdm_cluster_name }}" proxy cluster in StrongDM
-          {% if delete_credentials | default(false) | bool %}
-            - credentials/{{ sdm_cluster_name }}.yml (delete_credentials=true)
-          {% else %}
+          {% if keep_credentials | default(false) | bool %}
 
-          The encrypted credentials file is KEPT. Pass
-          -e delete_credentials=true to remove it too.
+          credentials/{{ sdm_cluster_name }}.yml is KEPT (keep_credentials=true).
+          Its key pair dies with the cluster — a later run will refuse to use it.
+          {% else %}
+            - credentials/{{ sdm_cluster_name }}.yml, whose key pair the
+              cluster deletion invalidates
           {% endif %}
 
           Press ENTER to continue, or Ctrl-C then A to abort
@@ -163,11 +168,13 @@
 
     # -- Credentials -------------------------------------------------------
 
+    # Removed by default, and deliberately so. The pair only has meaning for the
+    # cluster that issued it, and that cluster is gone by this point.
     - name: Remove the stored cluster credentials
       ansible.builtin.file:
         path: "{{ sdm_credentials_file }}"
         state: absent
-      when: delete_credentials | default(false) | bool
+      when: not (keep_credentials | default(false) | bool)
 
     - name: Teardown complete
       ansible.builtin.debug:
@@ -177,8 +184,8 @@
               ~ ' does not manage DNS.',
               'Local SSH key left at ' ~ ssh_key_path ~ ' — delete it manually'
               ~ ' if you want.']
-             + (['credentials/' ~ sdm_cluster_name ~ '.yml deleted.']
-                if delete_credentials | default(false) | bool
-                else ['credentials/' ~ sdm_cluster_name ~ '.yml kept. It is dead'
-                      ~ ' weight now the cluster is gone — pass'
-                      ~ ' -e delete_credentials=true to remove it.']) }}
+             + (['credentials/' ~ sdm_cluster_name ~ '.yml kept, but its key pair'
+                 ~ ' died with the cluster. site.yml will refuse to reuse it.']
+                if keep_credentials | default(false) | bool
+                else ['credentials/' ~ sdm_cluster_name ~ '.yml deleted along'
+                      ~ ' with the cluster that issued it.']) }}

@@ -430,7 +430,17 @@
     # Create the cluster, if this is the first run
     # =====================================================================
 
-    - name: Check whether the proxy cluster already exists in StrongDM
+    # Runs unconditionally, including when credentials were already found.
+    #
+    # It is tempting to skip this when a key pair is already in hand — there is
+    # nothing to create, so why ask? Because holding a key pair is not evidence
+    # that the cluster still exists. Deleting a cluster does not delete the
+    # credentials file, so a teardown followed by a re-run would sail past
+    # creation on the strength of a stale file and hand every worker keys for a
+    # cluster that is gone. The workers install fine and then fail to
+    # authenticate, which surfaces two plays later as a bind timeout on 8443 and
+    # looks nothing like the actual cause.
+    - name: Check whether the proxy cluster exists in StrongDM
       ansible.builtin.command:
         cmd: sdm admin nodes list --json --filter "name:{{ sdm_cluster_name }}"
       environment:
@@ -440,12 +450,39 @@
       changed_when: false
       failed_when: false
       no_log: true
-      when: cluster_access_key | length == 0
 
     - name: Record whether that cluster is already present
       ansible.builtin.set_fact:
         cluster_exists: >-
           {{ sdm_cluster_name in (existing_cluster.stdout | default('')) }}
+
+    - name: Fail if the stored credentials belong to a cluster that no longer exists
+      ansible.builtin.fail:
+        msg: |
+          Stale credentials.
+
+          credentials/{{ sdm_cluster_name }}.yml holds a key pair, but no
+          cluster named "{{ sdm_cluster_name }}" exists in StrongDM. Almost
+          always this means teardown.yml deleted the cluster and the credentials
+          file outlived it.
+
+          Continuing would install workers with keys nothing will accept. They
+          would come up, fail to authenticate, and never bind
+          port {{ sdm_worker_bind_port }} — a failure that looks like a
+          networking problem and is not one.
+
+          Delete the stale file and re-run; the cluster will be recreated and
+          fresh credentials stored:
+
+            rm credentials/{{ sdm_cluster_name }}.yml
+            ansible-playbook site.yml
+
+          Existing workers do not need rebuilding — the re-run rewrites their
+          environment file with the new key pair and restarts them.
+      when:
+        - credentials_already_stored | bool
+        - not cluster_exists | bool
+        - sdm_proxy_cluster_access_key | default('') | length == 0
 
     # Without this guard a second run with a missing credentials file would
     # create a duplicate cluster in StrongDM. The worker install is idempotent;
@@ -591,6 +628,41 @@
 
           See README "Bring your own cluster".
       when: cluster_access_key | length == 0 or cluster_secret_key | length == 0
+
+    # -- Validate ----------------------------------------------------------
+    # Whatever the source — CLI parse, prompt, stored file, or vault.yml — the
+    # pair has to be structurally sound before it is stored or shipped to a
+    # worker. "Non-empty" was the only check here previously, and non-empty is
+    # not the same as usable: a malformed secret passes it, gets encrypted and
+    # stored as though it were good, and then every worker fails to
+    # authenticate. The symptom appears two plays later as a bind timeout, which
+    # points at the network rather than at the key.
+    #
+    # A StrongDM cluster secret is standard base64 — so any `=` can only be
+    # trailing padding, and the length must be a multiple of four. Both
+    # conditions catch the spliced-secret corruption this playbook used to cause
+    # (`<secret><partial><secret>` has `=` mid-string and a length of 142).
+    - name: Assert that the cluster credentials are well-formed
+      ansible.builtin.assert:
+        that:
+          - cluster_access_key is match('^pk-[0-9a-zA-Z]{8,}$')
+          - cluster_secret_key is match('^[A-Za-z0-9+/]{16,}={0,2}$')
+          - cluster_secret_key | length % 4 == 0
+        fail_msg: >-
+          The cluster credentials are malformed. The access key must look like
+          `pk-` followed by at least 8 alphanumerics; the secret must be valid
+          standard base64, meaning padding only at the end and a length that is
+          a multiple of four (got {{ cluster_secret_key | length }} characters).
+
+          If they came from vault.yml or a prompt, re-copy them from the Admin
+          UI under Networking > Proxy Clusters > "{{ sdm_cluster_name }}" >
+          Keys — a truncated paste is the usual cause.
+
+          If this run created the cluster, the CLI output format has changed and
+          the parse picked up the wrong field. Set
+          sdm_credentials_prompt: true and paste the pair by hand; it will be
+          stored and reused from then on.
+        quiet: true
 
     # -- Persist -----------------------------------------------------------
     # Written the instant the pair is known, before any instance is launched.
@@ -920,12 +992,24 @@
       when: not sdm_installed.stat.exists
 
     # The documented install flow is interactive: it prompts for the access key
-    # and then the secret key. Two things make it unattended here —
-    #   1. the keys are exported as SDM_PROXY_CLUSTER_* env vars, which the
-    #      worker reads natively, and
-    #   2. the same pair is piped on stdin, which satisfies the prompts if the
-    #      installer asks anyway.
-    # Whichever path the binary takes, the task completes without a TTY.
+    # and then the secret key. The SDM_PROXY_CLUSTER_* environment variables are
+    # the documented non-interactive path, and they are the ONLY mechanism used
+    # here.
+    #
+    # An earlier version also piped the pair on stdin as
+    # `"{{ access }}\n{{ secret }}"`, on the theory that belt and braces beats
+    # either alone. It does not. The installer consumed both, and because the
+    # secret had no terminating newline the reader hit EOF mid-line and retried,
+    # splicing the buffer — writing the secret into
+    # /etc/sysconfig/sdm-worker three times over as
+    # `<secret><first 30 chars of secret><secret>`. The access key, terminated
+    # by its newline, came through clean, which is what made the corruption look
+    # like a key-parsing problem rather than an install one.
+    #
+    # The worker then failed to authenticate and never bound its traffic port,
+    # surfacing two plays later as a bind timeout that looks like a firewall
+    # fault. Hence the explicit verification below: never trust that this file
+    # says what it was told to say.
     #
     # Every worker gets the same pair — that is how they join one cluster
     # rather than becoming several. `creates:` makes this idempotent, so a
@@ -937,7 +1021,6 @@
           --worker-bind-addr :{{ sdm_worker_bind_port }}
           --app-domain {{ sdm_app_domain }}
         chdir: "{{ sdm_download_dir }}"
-        stdin: "{{ worker_access_key }}\n{{ worker_secret_key }}"
         creates: "{{ sdm_env_file }}"
       environment:
         SDM_PROXY_CLUSTER_ACCESS_KEY: "{{ worker_access_key }}"
@@ -991,6 +1074,28 @@
         label: "{{ item.key }}"
       when: item.value | string | length > 0
       notify: Restart the StrongDM worker
+
+    # Validated on the worker rather than by comparing values through Ansible,
+    # so the secret never reaches a command line or a log. `base64 -d` is the
+    # exact check the worker itself performs: the tripled secret this playbook
+    # used to produce fails here with "invalid input", where the worker reported
+    # it as `illegal base64 data at input byte 56` from inside a restart loop.
+    #
+    # Catches corruption from any source — the installer, a hand-edit, a
+    # half-finished previous run — before the service is asked to start.
+    - name: Verify the credentials in the environment file are well-formed
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          n=$(grep -c '^SDM_PROXY_CLUSTER_SECRET_KEY=' {{ sdm_env_file }})
+          [ "$n" -eq 1 ] || { echo "expected 1 secret key line, found $n" >&2; exit 1; }
+          v=$(grep -m1 '^SDM_PROXY_CLUSTER_SECRET_KEY=' {{ sdm_env_file }} | cut -d= -f2-)
+          printf '%s' "$v" | base64 -d > /dev/null \
+            || { echo "secret key is not valid base64 (length ${#v})" >&2; exit 1; }
+          grep -qE '^SDM_PROXY_CLUSTER_ACCESS_KEY=pk-[0-9a-zA-Z]{8,}$' {{ sdm_env_file }} \
+            || { echo "access key line is missing or malformed" >&2; exit 1; }
+        executable: /bin/bash
+      changed_when: false
 
     - name: Flush handlers so the service picks up configuration changes
       ansible.builtin.meta: flush_handlers

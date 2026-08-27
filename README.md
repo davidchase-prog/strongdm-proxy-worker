@@ -529,12 +529,12 @@ The load balancer goes first, deliberately — an ENI it still holds would block
 the security group delete, and the target group can't go while a listener
 references it.
 
-The encrypted credentials file is **kept** by default — once the cluster is
-deleted its key pair is worthless, but deleting the wrong file is
-unrecoverable, so removing it is opt-in:
+The credentials file goes with the cluster. Deleting the cluster invalidates its
+key pair, so keeping the file leaves a trap for the next run — see
+[Stale credentials](#stale-credentials). To keep it anyway:
 
 ```bash
-ansible-playbook teardown.yml -e delete_credentials=true
+ansible-playbook teardown.yml -e keep_credentials=true
 ```
 
 Skip the confirmation prompt in CI with `-e auto_approve=true`.
@@ -609,9 +609,39 @@ Precedence, highest first:
 | Source | When |
 |---|---|
 | `sdm_proxy_cluster_*` in `vault.yml` | You supplied a pair explicitly — see below |
-| `credentials/<cluster>.yml` | A previous run stored it |
+| `credentials/<cluster>.yml` | A previous run stored it **and the cluster still exists** |
 | `create-proxy-cluster` | First run for this cluster |
 | Interactive prompt | The above failed and `sdm_credentials_prompt` is `true` |
+
+### Stale credentials
+
+Holding a key pair is not evidence that the cluster still exists, and conflating
+the two is the sharpest edge in this design. Deleting a cluster does not delete
+the credentials file, so a teardown followed by a re-run could sail past cluster
+creation on the strength of a stale file and hand every worker keys nothing
+accepts.
+
+The workers install cleanly, fail to authenticate, and never bind their traffic
+port — which surfaces two plays later as `Timeout when waiting for 0.0.0.0:8443`
+and looks exactly like a networking or security group problem. It isn't one.
+
+Two guards, because either alone is insufficient:
+
+- `site.yml` checks whether the cluster exists on **every** run, including when
+  it already holds credentials, and refuses to continue on a mismatch.
+- `teardown.yml` deletes the credentials file by default, so the situation is
+  not created in the first place.
+
+If you hit it anyway — a cluster deleted in the Admin UI rather than by
+teardown, say — the recovery is cheap:
+
+```bash
+rm credentials/<cluster>.yml
+ansible-playbook site.yml
+```
+
+Existing workers don't need rebuilding. The re-run rewrites the key pair in
+`/etc/sysconfig/sdm-worker` and restarts the service.
 
 ### Back it up
 
@@ -675,8 +705,8 @@ while leaving your existing keys alone is fine.
 ## How the unattended install works
 
 The documented install is interactive — it prompts for the access key, then the
-secret key. Two mechanisms make it work without a TTY, and the playbook uses
-both so it succeeds either way:
+secret key. The `SDM_PROXY_CLUSTER_*` environment variables are the documented
+non-interactive path, and they're the only mechanism the playbook uses:
 
 ```yaml
 - name: Install the StrongDM proxy worker as a systemd service
@@ -685,19 +715,47 @@ both so it succeeds either way:
       {{ sdm_download_dir }}/sdm install --worker
       --worker-bind-addr :{{ sdm_worker_bind_port }}
       --app-domain {{ sdm_app_domain }}
-    stdin: "{{ worker_access_key }}\n{{ worker_secret_key }}"
     creates: "{{ sdm_env_file }}"
   environment:
     SDM_PROXY_CLUSTER_ACCESS_KEY: "{{ worker_access_key }}"
     SDM_PROXY_CLUSTER_SECRET_KEY: "{{ worker_secret_key }}"
 ```
 
-1. The keys are exported as `SDM_PROXY_CLUSTER_*`, which the worker reads natively.
-2. The same pair is piped on stdin, satisfying the prompts if the installer asks anyway.
-
 `creates:` pointing at `/etc/sysconfig/sdm-worker` is what makes re-runs a no-op.
 The `command` module has no idempotence of its own, so without it every run
 would reinstall.
+
+> **Do not also pipe the pair on stdin.** An earlier version did, as
+> `stdin: "{{ access }}\n{{ secret }}"`, reasoning that belt and braces beats
+> either mechanism alone. It doesn't. The installer consumed both, and because
+> the secret had no terminating newline the reader hit EOF mid-line and retried,
+> splicing its buffer — writing the secret into the env file three times over as
+> `<secret><first 30 chars><secret>`. The access key, terminated by its newline,
+> came through clean.
+>
+> The worker then failed to authenticate and never bound its traffic port. What
+> you see is `Timeout when waiting for 0.0.0.0:8443` from the playbook and
+> `illegal base64 data at input byte 56` in `journalctl -u sdm-worker` — a
+> corrupt-credential fault wearing a firewall fault's clothing.
+
+### Credential validation
+
+Because of the above, "non-empty" isn't a sufficient check on a key pair, and
+two guards now exist:
+
+- **On the control node**, before anything is stored or shipped: the access key
+  must match `pk-` plus at least 8 alphanumerics, and the secret must be valid
+  standard base64 — padding only at the end, length a multiple of four. The
+  spliced secret fails both (an `=` mid-string, and a length of 142).
+- **On each worker**, after the install and before the service starts: exactly
+  one `SDM_PROXY_CLUSTER_SECRET_KEY` line, and `base64 -d` accepts its value.
+  This is precisely the check the worker itself performs, run somewhere the
+  failure is legible.
+
+Neither catches a *cleanly truncated* secret — a paste that lost its tail but
+kept valid base64 shape passes both, and only StrongDM's control plane can
+reject it. If a worker authenticates cleanly on one run and not the next, suspect
+the paste before suspecting the playbook.
 
 ---
 
@@ -902,6 +960,18 @@ ansible sdm_workers -m command -a 'grep ORCHESTRATOR /etc/sysconfig/sdm-worker' 
 As a last resort set `nlb_health_check_protocol: TCP` and drop
 `health_check_path` — but you lose graceful draining during rolling upgrades,
 so treat it as a diagnostic rather than a fix.
+
+**`Timeout when waiting for 0.0.0.0:8443` on every worker**
+The workers installed but the service isn't listening. Nearly always the key
+pair is wrong rather than anything to do with networking — check
+`journalctl -u sdm-worker -n 40` for an authentication failure. The usual cause
+is credentials for a cluster that no longer exists; see
+[Stale credentials](#stale-credentials).
+
+**`Stale credentials.` at the start of a run**
+Working as intended — the guard described in
+[Stale credentials](#stale-credentials) caught a credentials file whose cluster
+is gone. `rm` the file and re-run.
 
 **`curl` through the NLB hangs instead of returning 404**
 Almost always no healthy targets — an NLB with an empty target group blackholes
