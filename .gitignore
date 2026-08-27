@@ -3,6 +3,19 @@ vault.yml
 *.vault
 .ansible-vault-pass
 
+# Cluster credentials.
+#
+# credentials/*.yml is ansible-vault encrypted, so committing it is safe and
+# arguably the right call: a proxy cluster's key pair is issued once and can
+# never be re-read, so the encrypted file is the only copy. Committing it means
+# a teammate can add a worker to the cluster; not committing it means only the
+# machine that created the cluster can.
+#
+# Ignored here as the conservative default. Un-ignore it deliberately, or back
+# the directory up somewhere your team can reach — see README
+# "Credential persistence".
+credentials/
+
 # SSH keys
 *.pem
 id_ed25519*

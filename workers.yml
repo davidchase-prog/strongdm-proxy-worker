@@ -1,0 +1,99 @@
+---
+# ============================================================================
+# Proxy cluster topology — the one file you edit to grow or shrink the cluster
+# ============================================================================
+#
+# A StrongDM proxy cluster is one logical entity with many worker nodes behind
+# a single address. Clients resolve that address, connect to whichever worker
+# they land on, and authenticate against the cluster — not against a node. So:
+#
+#   * every worker in a cluster shares ONE access key / secret key pair
+#   * that pair is minted once, when the cluster is created, and cannot be
+#     re-read or re-minted from the CLI afterwards
+#   * therefore the playbook encrypts it to credentials/<cluster>.yml on the
+#     first run and reads it back on every run after that
+#
+# See README "Scaling the cluster" and "Credential persistence".
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# The cluster
+# ---------------------------------------------------------------------------
+# Human-readable name in StrongDM. Also the key for the credentials file and
+# the Cluster tag on every AWS resource, so teardown can scope itself.
+sdm_cluster_name: dc-ansible-cluster
+
+# ---------------------------------------------------------------------------
+# How clients reach the cluster
+# ---------------------------------------------------------------------------
+# StrongDM requires a network load balancer for any cluster with more than one
+# proxy worker. The cluster's address is the load balancer's address, and it is
+# baked in at creation time — it CANNOT be changed afterwards.
+#
+#   nlb     The playbook creates an internet-facing AWS Network Load Balancer
+#           and uses its DNS name as the cluster address. Nothing to set up:
+#           AWS supplies a stable, publicly resolvable hostname. This is the
+#           right choice for a demo or an AWS-native deployment.
+#
+#   manual  You already have a load balancer (or are building one) and manage
+#           its DNS yourself. Set sdm_cluster_hostname below; the playbook
+#           creates no AWS load balancer and prints the worker addresses to
+#           register with yours. This is the shape a client environment takes.
+#
+# Note that `manual` does NOT mean round-robin A records pointing at the
+# workers. That looks like it should work and StrongDM does not support it: a
+# worker taken out for a rolling upgrade stays in DNS rotation, and clients
+# land on a node that is draining.
+sdm_cluster_endpoint: nlb
+
+# Required in manual mode, ignored in nlb mode. The hostname clients resolve,
+# pointing at YOUR load balancer.
+sdm_cluster_hostname: ""
+
+# Port the cluster advertises — the port clients connect to on the load
+# balancer. StrongDM's recommendation is 443 in, 8443 to the workers.
+sdm_cluster_port: 443
+
+# Port each worker binds for traffic from the load balancer.
+#
+#   8443  StrongDM's documented production shape, and what nlb mode uses.
+#         Needs no root privilege to bind.
+#   443   Only sensible for a single-worker cluster with no load balancer,
+#         where clients connect to the worker directly.
+sdm_worker_bind_port: 8443
+
+# ---------------------------------------------------------------------------
+# The workers
+# ---------------------------------------------------------------------------
+# Add an entry and re-run site.yml to grow the cluster. Runs are ADD-ONLY:
+# anything already provisioned is left alone, anything missing is created,
+# joined to the existing cluster, and registered with the load balancer.
+#
+# Removing an entry does NOT destroy the instance — use teardown.yml for that.
+#
+# Per-worker keys:
+#   name             required. EC2 Name tag and the instance's hostname.
+#                    Must be unique within the cluster.
+#   instance_type    optional. Defaults to `instance_type` in group_vars/all.yml.
+#   root_volume_gb   optional. Defaults to `root_volume_gb` in group_vars/all.yml.
+#   subnet_id        optional. Defaults to round-robin across the resolved
+#                    subnets, which spreads the fleet over availability zones.
+#                    Set it to pin a worker to a specific subnet.
+#
+# Two workers is StrongDM's documented minimum for high availability, and an
+# NLB needs subnets in at least two availability zones regardless.
+sdm_workers:
+  - name: sdm-proxy-worker-01
+  - name: sdm-proxy-worker-02
+
+# Larger example — uncomment and adjust:
+#
+# sdm_workers:
+#   - name: sdm-proxy-worker-01
+#     subnet_id: subnet-0aaa11112222bbbb0
+#   - name: sdm-proxy-worker-02
+#     subnet_id: subnet-0ccc33334444dddd0
+#   - name: sdm-proxy-worker-03
+#     subnet_id: subnet-0eee55556666ffff0
+#     instance_type: t3.medium
+#     root_volume_gb: 16

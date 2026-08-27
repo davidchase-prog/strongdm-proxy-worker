@@ -28,6 +28,11 @@ keyed_groups:
   - key: ec2_tags.Project
     prefix: project
     separator: _
+  # One group per cluster, so ad-hoc commands can target a single fleet:
+  #   ansible cluster_dc_ansible_cluster -m command -a 'systemctl is-active sdm-worker' -b
+  - key: ec2_tags.Cluster
+    prefix: cluster
+    separator: _
 
 groups:
   sdm_workers: "'strongdm-ansible-demo' == ec2_tags.get('Project', '')"

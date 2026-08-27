@@ -1,40 +1,81 @@
 ---
 # ===========================================================================
-# Destroy everything site.yml created
+# Destroy everything site.yml created for one cluster
 # ===========================================================================
 #
 #   ansible-playbook teardown.yml
 #
-# Runs in reverse dependency order: StrongDM cluster, then EIP, instance,
-# security group, keypair. Every step is safe to re-run.
+# Scoped by the Cluster tag, so several clusters can share an account and this
+# only removes the one named in workers.yml. Runs in reverse dependency order:
+# StrongDM cluster, then EIPs, instances, security group, keypair. Every step
+# is safe to re-run.
+#
+# The encrypted credentials file is kept by default. Once the cluster is
+# deleted the key pair is worthless, but deleting the wrong file is
+# unrecoverable — so removing it is opt-in:
+#
+#   ansible-playbook teardown.yml -e delete_credentials=true
 # ===========================================================================
 
-- name: Tear down the StrongDM proxy worker demo
+- name: Tear down a StrongDM proxy cluster and its workers
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
+    - workers.yml
     - vault.yml
 
   tasks:
+
+    - name: Find the cluster's instances
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": strongdm-ansible-demo
+          "tag:Cluster": "{{ sdm_cluster_name }}"
+          instance-state-name:
+            - running
+            - stopped
+            - stopping
+            - pending
+      register: demo_instances
 
     - name: Confirm intent
       ansible.builtin.pause:
         prompt: |
 
-          This will DESTROY:
-            - EC2 instances tagged Project=strongdm-ansible-demo in {{ aws_region }}
-            - the "{{ worker_name }}-sg" security group and its Elastic IP
+          This will DESTROY, in {{ aws_region }}:
+
+            - {{ demo_instances.instances | length }} EC2 instance(s) tagged
+              Cluster={{ sdm_cluster_name }}:
+              {{ demo_instances.instances
+                 | map(attribute='tags')
+                 | map(attribute='Name')
+                 | join(', ') | default('none found', true) }}
+            - their Elastic IPs
+          {% if sdm_cluster_endpoint == 'nlb' %}
+            - the "{{ nlb_name }}" network load balancer and its
+              "{{ nlb_target_group_name }}" target group
+          {% endif %}
+            - the "{{ worker_sg_name }}" security group
             - the "{{ ssh_key_name }}" EC2 keypair
             - the "{{ sdm_cluster_name }}" proxy cluster in StrongDM
+          {% if delete_credentials | default(false) | bool %}
+            - credentials/{{ sdm_cluster_name }}.yml (delete_credentials=true)
+          {% else %}
+
+          The encrypted credentials file is KEPT. Pass
+          -e delete_credentials=true to remove it too.
+          {% endif %}
 
           Press ENTER to continue, or Ctrl-C then A to abort
       when: not (auto_approve | default(false) | bool)
 
     # -- StrongDM ----------------------------------------------------------
 
-    # `sdm admin nodes delete` accepts ID|NAME, so the cluster name is enough -
-    # no need to scrape an ID out of the list output.
+    # `sdm admin nodes delete` accepts ID|NAME, so the cluster name is enough —
+    # no need to scrape an ID out of the list output. Deleting the cluster
+    # invalidates its key pair for every worker at once.
     - name: Delete the proxy cluster
       ansible.builtin.command:
         cmd: sdm admin nodes delete {{ sdm_cluster_name }}
@@ -53,21 +94,35 @@
           exists, remove it in the Admin UI under Networking > Proxy Clusters.
       when: cluster_delete.rc != 0
 
+    # -- Load balancer -----------------------------------------------------
+    # Before the instances and the security group: an ENI held by the load
+    # balancer blocks the security group delete, and the target group cannot go
+    # while a listener still references it.
+
+    - name: Delete the network load balancer
+      community.aws.elb_network_lb:
+        region: "{{ aws_region }}"
+        name: "{{ nlb_name }}"
+        state: absent
+        wait: true
+        wait_timeout: 600
+      when: sdm_cluster_endpoint == 'nlb'
+      failed_when: false
+
+    - name: Delete the load balancer target group
+      community.aws.elb_target_group:
+        region: "{{ aws_region }}"
+        name: "{{ nlb_target_group_name }}"
+        state: absent
+      when: sdm_cluster_endpoint == 'nlb'
+      register: tg_delete
+      retries: 10
+      delay: 15
+      until: tg_delete is succeeded
+
     # -- AWS ---------------------------------------------------------------
 
-    - name: Find the demo instances
-      amazon.aws.ec2_instance_info:
-        region: "{{ aws_region }}"
-        filters:
-          "tag:Project": strongdm-ansible-demo
-          instance-state-name:
-            - running
-            - stopped
-            - stopping
-            - pending
-      register: demo_instances
-
-    - name: Release the Elastic IP
+    - name: Release the Elastic IPs
       amazon.aws.ec2_eip:
         region: "{{ aws_region }}"
         device_id: "{{ item.instance_id }}"
@@ -76,10 +131,10 @@
         state: absent
       loop: "{{ demo_instances.instances }}"
       loop_control:
-        label: "{{ item.instance_id }}"
+        label: "{{ item.tags.Name | default(item.instance_id) }}"
       failed_when: false
 
-    - name: Terminate the demo instances
+    - name: Terminate the instances
       amazon.aws.ec2_instance:
         region: "{{ aws_region }}"
         instance_ids: "{{ demo_instances.instances | map(attribute='instance_id') | list }}"
@@ -89,11 +144,11 @@
       when: demo_instances.instances | length > 0
 
     # The security group cannot be deleted while an ENI still references it,
-    # and termination releases those asynchronously.
+    # and termination releases those asynchronously — hence the retries.
     - name: Delete the security group
       amazon.aws.ec2_security_group:
         region: "{{ aws_region }}"
-        name: "{{ worker_name }}-sg"
+        name: "{{ worker_sg_name }}"
         state: absent
       register: sg_delete
       retries: 10
@@ -106,8 +161,24 @@
         name: "{{ ssh_key_name }}"
         state: absent
 
+    # -- Credentials -------------------------------------------------------
+
+    - name: Remove the stored cluster credentials
+      ansible.builtin.file:
+        path: "{{ sdm_credentials_file }}"
+        state: absent
+      when: delete_credentials | default(false) | bool
+
     - name: Teardown complete
       ansible.builtin.debug:
-        msg:
-          - "AWS resources removed."
-          - "Local SSH key left in place at {{ ssh_key_path }} - delete it manually if you want."
+        msg: >-
+          {{ ['AWS resources for cluster ' ~ sdm_cluster_name ~ ' removed.',
+              'Remove the ' ~ sdm_cluster_hostname ~ ' DNS records — the playbook'
+              ~ ' does not manage DNS.',
+              'Local SSH key left at ' ~ ssh_key_path ~ ' — delete it manually'
+              ~ ' if you want.']
+             + (['credentials/' ~ sdm_cluster_name ~ '.yml deleted.']
+                if delete_credentials | default(false) | bool
+                else ['credentials/' ~ sdm_cluster_name ~ '.yml kept. It is dead'
+                      ~ ' weight now the cluster is gone — pass'
+                      ~ ' -e delete_credentials=true to remove it.']) }}

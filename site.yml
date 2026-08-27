@@ -1,12 +1,21 @@
 ---
 # ===========================================================================
-# Install a StrongDM proxy cluster worker natively (binary + systemd) on EC2
+# Build a multi-worker StrongDM proxy cluster natively (binary + systemd) on EC2
 # ===========================================================================
 #
 #   ansible-playbook site.yml
 #
-# Play 1 runs on the control node and provisions AWS infrastructure.
-# Play 2 runs on the new instance and installs the worker.
+# Play 1  control node: resolve the cluster address and credentials, then
+#         provision the load balancer and one EC2 instance per entry in
+#         workers.yml.
+# Play 2  every worker in parallel: install and start the sdm worker service.
+# Play 3  control node: register the workers with the load balancer, wait for
+#         them to report healthy, and print what is left to do.
+#
+# Runs are ADD-ONLY. Add a worker to workers.yml, re-run, and the new instance
+# joins the existing cluster with the stored key pair and is registered as a
+# new target. Nothing already built is touched. Removing an entry destroys
+# nothing — that is teardown.yml's job.
 #
 # Terminology note: a "proxy worker" is a member of a StrongDM *proxy cluster*
 # (systemd unit sdm-worker, authenticates with an access key + secret key).
@@ -16,16 +25,19 @@
 # Docs: https://docs.strongdm.com/admin/networking/proxy-clusters
 # ===========================================================================
 
-- name: Provision the EC2 instance that will host the proxy worker
+- name: Resolve the cluster and provision the worker fleet
   hosts: localhost
   connection: local
   gather_facts: true
   vars_files:
+    - workers.yml
     - vault.yml
 
   tasks:
 
-    # -- Preflight ---------------------------------------------------------
+    # =====================================================================
+    # Preflight
+    # =====================================================================
 
     - name: Assert that the StrongDM admin token is set
       ansible.builtin.assert:
@@ -39,6 +51,51 @@
           then encrypt it with `ansible-vault encrypt vault.yml`.
         quiet: true
 
+    - name: Assert that workers.yml describes a usable cluster
+      ansible.builtin.assert:
+        that:
+          - sdm_cluster_name | default('') | length > 0
+          - sdm_cluster_endpoint | default('') in ['nlb', 'manual']
+          - sdm_workers | default([]) | length > 0
+          - sdm_workers | map(attribute='name') | list | length ==
+            sdm_workers | map(attribute='name') | unique | list | length
+        fail_msg: >-
+          workers.yml is incomplete. It needs sdm_cluster_name,
+          sdm_cluster_endpoint set to either "nlb" or "manual", and at least
+          one entry in sdm_workers with a unique name.
+        quiet: true
+
+    # Only enforced in manual mode. In nlb mode the address comes from AWS, so
+    # there is nothing for the operator to get wrong.
+    - name: Assert that a cluster hostname is set in manual mode
+      ansible.builtin.assert:
+        that:
+          - sdm_cluster_hostname | default('') | length > 0
+          - sdm_cluster_hostname != "sdm-cluster.example.com"
+        fail_msg: >-
+          sdm_cluster_endpoint is "manual", so sdm_cluster_hostname must name
+          the load balancer clients will resolve. The address is baked into the
+          cluster permanently and cannot be changed later, which is why the
+          placeholder is rejected rather than defaulted.
+
+          StrongDM requires a load balancer for any cluster with more than one
+          worker. If you do not have one, set sdm_cluster_endpoint: nlb and the
+          playbook will build one.
+        quiet: true
+      when: sdm_cluster_endpoint == 'manual'
+
+    - name: Warn if a multi-worker cluster is being built without a load balancer
+      ansible.builtin.debug:
+        msg: >-
+          {{ sdm_workers | length }} workers with sdm_cluster_endpoint=manual —
+          make sure sdm_cluster_hostname points at a load balancer, not at a
+          worker. StrongDM does not support DNS round-robin across workers: a
+          node draining for a rolling upgrade stays in DNS rotation and clients
+          land on it anyway.
+      when:
+        - sdm_cluster_endpoint == 'manual'
+        - sdm_workers | length > 1
+
     # --version is a global flag on the sdm binary, not a subcommand.
     # `sdm version` exits 3 with "No help topic for 'version'".
     - name: Assert that the sdm CLI is present on the control node
@@ -51,20 +108,76 @@
       ansible.builtin.debug:
         msg: "Control node sdm CLI: {{ sdm_version.stdout | trim }}"
 
-    # -- Network lookups ---------------------------------------------------
-    # Resolve the subnet, and take the VPC id from whatever subnet we land on.
+    # =====================================================================
+    # Existing cluster credentials
+    # =====================================================================
+    # Checked before anything is created, because a cluster whose key pair
+    # cannot be obtained is a cluster no worker can join. Creating the pair
+    # has to wait until the cluster's address is known (below); finding an
+    # existing one does not.
+    #
+    # Everything about this section exists because of one StrongDM constraint:
+    # a cluster's key pair is displayed exactly once, at creation, and there is
+    # no CLI command to read it back or mint a replacement.
+
+    - name: Look for stored credentials for this cluster
+      ansible.builtin.stat:
+        path: "{{ sdm_credentials_file }}"
+      register: stored_creds
+
+    # include_vars decrypts vault-encrypted files transparently, so the stored
+    # file needs no special handling here. `name:` keeps its keys in their own
+    # namespace instead of colliding with anything already defined.
+    - name: Load the stored credentials
+      ansible.builtin.include_vars:
+        file: "{{ sdm_credentials_file }}"
+        name: stored_cluster
+      when: stored_creds.stat.exists
+      no_log: true
+
+    - name: Settle on the credentials to use, if we already have them
+      ansible.builtin.set_fact:
+        cluster_access_key: >-
+          {{ sdm_proxy_cluster_access_key
+             if sdm_proxy_cluster_access_key | default('') | length > 0
+             else stored_cluster.sdm_cluster_access_key | default('') }}
+        cluster_secret_key: >-
+          {{ sdm_proxy_cluster_secret_key
+             if sdm_proxy_cluster_secret_key | default('') | length > 0
+             else stored_cluster.sdm_cluster_secret_key | default('') }}
+        credentials_already_stored: "{{ stored_creds.stat.exists }}"
+      no_log: true
+
+    - name: Report where the cluster credentials came from
+      ansible.builtin.debug:
+        msg: >-
+          {% if sdm_proxy_cluster_access_key | default('') | length > 0 -%}
+          Using the key pair supplied in vault.yml (bring your own cluster).
+          {%- elif credentials_already_stored | bool -%}
+          Reusing the stored key pair from
+          credentials/{{ sdm_cluster_name }}.yml — no cluster will be created.
+          {%- else -%}
+          No stored key pair for "{{ sdm_cluster_name }}" — this run will
+          create the cluster and store its credentials.
+          {%- endif %}
+
+    # =====================================================================
+    # Network
+    # =====================================================================
+    # Resolve the candidate subnets and take the VPC id from whichever we land
+    # on.
     #
     # Deliberately NOT using ec2_vpc_net_info: that module calls
     # DescribeVpcAttribute to report DNS settings we never read, which needs an
-    # extra IAM permission for no benefit. DescribeSubnets alone tells us both
-    # the subnet and its VPC.
+    # extra IAM permission for no benefit. DescribeSubnets alone tells us the
+    # subnets, their VPC, and their CIDRs.
     #
     # Filter precedence:
-    #   subnet_id set          -> use exactly that subnet
-    #   vpc_id set             -> first available subnet in that VPC
-    #   neither set            -> first default-for-AZ subnet (the default VPC)
+    #   subnet_id set  -> that subnet only, every worker lands in it
+    #   vpc_id set     -> all available subnets in that VPC
+    #   neither set    -> all default-for-AZ subnets (the default VPC)
 
-    - name: Resolve the target subnet
+    - name: Resolve the candidate subnets
       amazon.aws.ec2_vpc_subnet_info:
         region: "{{ aws_region }}"
         filters: "{{ _subnet_filters }}"
@@ -77,36 +190,93 @@
                        if (subnet_id | length == 0 and vpc_id | length == 0) else {}) }}
       register: vpc_subnets
 
-    - name: Assert that a usable subnet was found
+    - name: Assert that usable subnets were found
       ansible.builtin.assert:
         that:
           - vpc_subnets.subnets | length > 0
         fail_msg: >-
           No available subnet found in {{ aws_region }}. If this account has no
-          default VPC, set vpc_id and subnet_id explicitly in group_vars/all.yml.
+          default VPC, set vpc_id (and optionally subnet_id) in
+          group_vars/all.yml.
         quiet: true
 
+    # Sorted by AZ so the round-robin below is deterministic: worker 01 always
+    # lands in the same subnet across runs, which keeps re-runs idempotent.
     - name: Set the target network
       ansible.builtin.set_fact:
-        target_subnet_id: "{{ _chosen_subnet.subnet_id }}"
-        target_vpc_id: "{{ _chosen_subnet.vpc_id }}"
+        target_subnet_ids: "{{ _sorted | map(attribute='subnet_id') | list }}"
+        target_subnet_azs: "{{ _sorted | map(attribute='availability_zone') | list }}"
+        target_subnet_cidrs: "{{ _sorted | map(attribute='cidr_block') | list }}"
+        target_vpc_id: "{{ (_sorted | first).vpc_id }}"
       vars:
-        _chosen_subnet: >-
-          {{ vpc_subnets.subnets | sort(attribute='availability_zone') | first }}
+        _sorted: "{{ vpc_subnets.subnets | sort(attribute='availability_zone') }}"
 
     - name: Report the resolved network
       ansible.builtin.debug:
-        msg: "Deploying into VPC {{ target_vpc_id }} / subnet {{ target_subnet_id }} in {{ aws_region }}"
+        msg: >-
+          VPC {{ target_vpc_id }} in {{ aws_region }},
+          {{ target_subnet_ids | length }} subnet(s) across
+          {{ target_subnet_azs | join(', ') }}
+
+    # An AWS requirement, not a StrongDM one: an NLB must be given subnets in
+    # at least two availability zones. Caught here rather than 200 lines later
+    # inside a boto3 exception.
+    - name: Assert that the network can host a load balancer
+      ansible.builtin.assert:
+        that:
+          - target_subnet_azs | unique | length >= 2
+        fail_msg: >-
+          sdm_cluster_endpoint is "nlb", but only
+          {{ target_subnet_azs | unique | length }} availability zone(s) were
+          resolved ({{ target_subnet_azs | join(', ') }}). An AWS network load
+          balancer requires subnets in at least two. Clear the global
+          subnet_id override in group_vars/all.yml, or set vpc_id to a VPC with
+          subnets in two or more zones.
+        quiet: true
+      when: sdm_cluster_endpoint == 'nlb'
+
+    # Defaults are applied here rather than inline at every reference, so the
+    # rest of the play works from one uniform list. The subnet round-robin is
+    # what spreads a multi-worker cluster across availability zones — the whole
+    # reason to run more than one worker.
+    - name: Apply defaults to each worker definition
+      ansible.builtin.set_fact:
+        workers_resolved: "{{ workers_resolved | default([]) + [_resolved] }}"
+      vars:
+        _idx: "{{ workers_resolved | default([]) | length }}"
+        _resolved:
+          name: "{{ item.name }}"
+          instance_type: "{{ item.instance_type | default(instance_type) }}"
+          root_volume_gb: "{{ item.root_volume_gb | default(root_volume_gb) }}"
+          subnet_id: >-
+            {{ item.subnet_id
+               | default(target_subnet_ids[(_idx | int) % (target_subnet_ids | length)]) }}
+      loop: "{{ sdm_workers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Report the planned fleet
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }}: {{ item.instance_type }},
+          {{ item.root_volume_gb }} GB, subnet {{ item.subnet_id }}
+      loop: "{{ workers_resolved }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # =====================================================================
+    # Shared infrastructure
+    # =====================================================================
 
     # -- SSH key -----------------------------------------------------------
     # Generated locally rather than downloaded from AWS, so the private key
     # never transits the API and re-runs are idempotent.
 
-    - name: Generate an SSH keypair for the demo
+    - name: Generate an SSH keypair for the fleet
       community.crypto.openssh_keypair:
         path: "{{ ssh_key_path | expanduser }}"
         type: ed25519
-        comment: "strongdm-ansible-demo"
+        comment: "strongdm-ansible-{{ sdm_cluster_name }}"
         mode: "0600"
       register: demo_ssh_key
 
@@ -119,17 +289,31 @@
         state: present
 
     # -- Security group ----------------------------------------------------
-    # Two ingress rules only:
-    #   443 from client CIDRs  -> StrongDM clients connecting to the worker
-    #   22  from control node  -> Ansible itself
+    # One group for the whole cluster. Every worker has identical ingress
+    # requirements, so a shared group means adding a worker needs no firewall
+    # change at all.
+    #
+    # Three ingress rules:
+    #   worker port from client CIDRs  -> client traffic. Note that an NLB with
+    #                                     instance targets preserves the client
+    #                                     source IP, so the original client
+    #                                     address is what arrives here — not the
+    #                                     load balancer's.
+    #   liveness    from subnet CIDRs  -> health checks, which DO originate from
+    #                                     the load balancer's own addresses in
+    #                                     these subnets. Never open this to the
+    #                                     internet; it is an unauthenticated
+    #                                     status endpoint.
+    #   22          from control node  -> Ansible itself
+    #
     # Egress is left as AWS creates it (allow all), which covers
     # app.strongdm.com, downloads.strongdm.com, and the proxied resources.
 
-    - name: Create the proxy worker security group
+    - name: Create the proxy cluster security group
       amazon.aws.ec2_security_group:
         region: "{{ aws_region }}"
-        name: "{{ worker_name }}-sg"
-        description: "StrongDM proxy worker - client ingress and Ansible SSH"
+        name: "{{ worker_sg_name }}"
+        description: "StrongDM proxy cluster {{ sdm_cluster_name }} - client, health check, and Ansible SSH"
         vpc_id: "{{ target_vpc_id }}"
         tags: "{{ resource_tags }}"
         rules:
@@ -137,7 +321,12 @@
             ports:
               - "{{ sdm_worker_bind_port }}"
             cidr_ip: "{{ client_ingress_cidrs }}"
-            rule_desc: "StrongDM client traffic to the proxy worker"
+            rule_desc: "StrongDM client traffic to the proxy workers"
+          - proto: tcp
+            ports:
+              - "{{ sdm_liveness_port }}"
+            cidr_ip: "{{ target_subnet_cidrs }}"
+            rule_desc: "Load balancer liveness health checks"
           - proto: tcp
             ports:
               - 22
@@ -153,13 +342,330 @@
         # -1/all-protocol rule, which AWS rejects with "Failed to update
         # security group rule descriptions egress". It reads like a permissions
         # error and is not one.
-        #
-        # Egress is left exactly as AWS created it: all protocols, all
-        # destinations - which is what the worker needs to reach
-        # app.strongdm.com, downloads.strongdm.com, and the resources it proxies.
         purge_rules_egress: false
         state: present
       register: worker_sg
+
+    # -- Load balancer -----------------------------------------------------
+    # StrongDM requires a load balancer for any cluster with more than one
+    # worker, and the cluster's address is the load balancer's address. So this
+    # has to exist before the cluster is created.
+    #
+    # The target group is created first and referenced by name from the
+    # listener, which avoids a chicken-and-egg on ARNs.
+
+    - name: Create the load balancer target group
+      community.aws.elb_target_group:
+        region: "{{ aws_region }}"
+        name: "{{ nlb_target_group_name }}"
+        vpc_id: "{{ target_vpc_id }}"
+        protocol: TCP
+        port: "{{ sdm_worker_bind_port }}"
+        target_type: instance
+        # StrongDM's recommendation. Without it the workers see the load
+        # balancer's address as the client's, and per-client audit data and any
+        # source-IP policy on the proxied resources become useless.
+        preserve_client_ip_enabled: true
+        # The liveness probe, not the traffic port. A worker draining for a
+        # rolling upgrade keeps serving 8443 but shuts this port down — that is
+        # precisely how it asks to be taken out of rotation.
+        health_check_protocol: "{{ nlb_health_check_protocol }}"
+        health_check_port: "{{ sdm_liveness_port }}"
+        health_check_path: "{{ sdm_liveness_path }}"
+        successful_response_codes: "{{ nlb_health_check_codes }}"
+        health_check_interval: "{{ nlb_health_check_interval }}"
+        healthy_threshold_count: "{{ nlb_healthy_threshold }}"
+        unhealthy_threshold_count: "{{ nlb_unhealthy_threshold }}"
+        # Targets are registered in play 3, once the workers are actually
+        # installed. Left true, this module would treat an empty target list as
+        # the desired state and deregister the running fleet on every re-run.
+        modify_targets: false
+        tags: "{{ resource_tags }}"
+        state: present
+      register: worker_target_group
+      when: sdm_cluster_endpoint == 'nlb'
+
+    - name: Create the network load balancer
+      community.aws.elb_network_lb:
+        region: "{{ aws_region }}"
+        name: "{{ nlb_name }}"
+        subnets: "{{ target_subnet_ids }}"
+        scheme: internet-facing
+        cross_zone_load_balancing: "{{ nlb_cross_zone }}"
+        # TCP, not TLS. StrongDM proxy workers terminate mutual TLS themselves
+        # and validate client certificates directly; a TLS listener here would
+        # break the handshake it is trying to help with. An ALB cannot do this
+        # at all, which is why the docs say network load balancer specifically.
+        listeners:
+          - Protocol: TCP
+            Port: "{{ sdm_cluster_port }}"
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: "{{ nlb_target_group_name }}"
+        tags: "{{ resource_tags }}"
+        state: present
+        wait: true
+        wait_timeout: 600
+      register: worker_nlb
+      when: sdm_cluster_endpoint == 'nlb'
+
+    # The address is fixed at cluster creation and cannot be changed. In nlb
+    # mode AWS supplies it; note that it embeds a generated hash, so deleting
+    # and recreating the load balancer yields a DIFFERENT address and orphans
+    # the cluster. See README "Rebuilding in nlb mode".
+    - name: Determine the cluster's advertised address
+      ansible.builtin.set_fact:
+        cluster_address: >-
+          {{ (worker_nlb.dns_name if sdm_cluster_endpoint == 'nlb'
+              else sdm_cluster_hostname) ~ ':' ~ sdm_cluster_port }}
+
+    - name: Report the cluster address
+      ansible.builtin.debug:
+        msg: >-
+          Cluster address: {{ cluster_address }}
+          ({{ 'AWS-provided NLB hostname' if sdm_cluster_endpoint == 'nlb'
+              else 'your load balancer, DNS managed by you' }})
+
+    # =====================================================================
+    # Create the cluster, if this is the first run
+    # =====================================================================
+
+    - name: Check whether the proxy cluster already exists in StrongDM
+      ansible.builtin.command:
+        cmd: sdm admin nodes list --json --filter "name:{{ sdm_cluster_name }}"
+      environment:
+        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      register: existing_cluster
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: cluster_access_key | length == 0
+
+    - name: Record whether that cluster is already present
+      ansible.builtin.set_fact:
+        cluster_exists: >-
+          {{ sdm_cluster_name in (existing_cluster.stdout | default('')) }}
+
+    # Without this guard a second run with a missing credentials file would
+    # create a duplicate cluster in StrongDM. The worker install is idempotent;
+    # cluster creation is not.
+    - name: Create the proxy cluster
+      ansible.builtin.command:
+        cmd: >-
+          sdm admin nodes create-proxy-cluster
+          --name {{ sdm_cluster_name }}
+          --tags Project=strongdm-ansible-demo,Cluster={{ sdm_cluster_name }},ManagedBy=ansible
+          {{ cluster_address }}
+      environment:
+        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
+        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
+      register: cluster_create
+      changed_when: cluster_create.rc == 0
+      no_log: true
+      when:
+        - cluster_access_key | length == 0
+        - not cluster_exists | bool
+
+    # `create-proxy-cluster` prints the cluster's first authentication key on
+    # success. The output format is not documented and has changed between CLI
+    # releases, so match both the JSON and the human-readable shapes and treat
+    # "no match" as a recoverable condition rather than an error.
+    #
+    # regex_findall returns capture groups as a list, which sidesteps
+    # backreference escaping entirely. An empty list is a clean "not found".
+    #
+    # Note the deliberate absence of an intermediate `_out: "{{ ...stdout }}"`
+    # var. Ansible runs literal_eval over a template's result, so putting JSON
+    # output through a var of its own silently turns the string into a dict —
+    # after which the patterns below are matching against a Python repr with
+    # single quotes and never fire. Filtering stdout directly keeps it a string.
+    - name: Extract the cluster key pair from the CLI output
+      vars:
+        _access: >-
+          {{ cluster_create.stdout | default('')
+             | regex_findall('pk-[0-9a-zA-Z]{8,}') }}
+        # The quote in the separator class is what makes one pattern cover both
+        # `"secretKey":"..."` and `secret key: ...`.
+        #
+        # Single backslash before the s, not double. This is a folded block
+        # scalar, where YAML does no escape processing at all — `\\s` would
+        # reach the regex engine as an escaped backslash plus a literal `s`,
+        # putting `s` in the separator class instead of whitespace. Under
+        # ignorecase that silently eats the first character of the secret.
+        _secret: >-
+          {{ cluster_create.stdout | default('')
+             | regex_findall('secret[-_ ]?key["\s:=]+([A-Za-z0-9+/=_-]{16,})',
+                             ignorecase=true) }}
+      ansible.builtin.set_fact:
+        cluster_access_key: "{{ _access[0] if _access | length > 0 else '' }}"
+        cluster_secret_key: "{{ _secret[0] if _secret | length > 0 else '' }}"
+      no_log: true
+      when: cluster_create is not skipped
+
+    # -- Manual fallback ---------------------------------------------------
+    # Reached in two situations, both of which are otherwise dead ends:
+    #
+    #   * the cluster was created but its key could not be parsed out
+    #   * the cluster already exists and no credentials file was ever stored
+    #
+    # Either way the pair is available in the Admin UI and nowhere else, so ask
+    # for it once and persist it. Set sdm_credentials_prompt=false to make this
+    # a hard failure instead — required for unattended runs.
+
+    - name: Explain what is needed before prompting
+      vars:
+        _why: >-
+          {%- if cluster_exists | bool -%}
+          The cluster "{{ sdm_cluster_name }}" already exists and no
+          credentials were ever stored for it.
+          {%- else -%}
+          The cluster was created but its key pair could not be parsed out of
+          the CLI output.
+          {%- endif -%}
+      ansible.builtin.debug:
+        msg:
+          - "The cluster key pair could not be obtained automatically."
+          - ""
+          - "{{ _why }}"
+          - ""
+          - "Get the pair from: Admin UI > Networking > Proxy Clusters >"
+          - "\"{{ sdm_cluster_name }}\" > Keys > Add authentication key"
+          - ""
+          - "Paste it at the prompts below. It will be encrypted to"
+          - "credentials/{{ sdm_cluster_name }}.yml and reused on every future run."
+      when:
+        - cluster_access_key | length == 0 or cluster_secret_key | length == 0
+        - sdm_credentials_prompt | bool
+
+    - name: Prompt for the cluster access key
+      ansible.builtin.pause:
+        prompt: "Cluster access key (pk-...)"
+      register: access_key_prompt
+      when:
+        - cluster_access_key | length == 0 or cluster_secret_key | length == 0
+        - sdm_credentials_prompt | bool
+
+    - name: Prompt for the cluster secret key
+      ansible.builtin.pause:
+        prompt: "Cluster secret key (input hidden)"
+        echo: false
+      register: secret_key_prompt
+      when:
+        - cluster_access_key | length == 0 or cluster_secret_key | length == 0
+        - sdm_credentials_prompt | bool
+
+    - name: Take the prompted credentials
+      ansible.builtin.set_fact:
+        cluster_access_key: "{{ access_key_prompt.user_input | trim }}"
+        cluster_secret_key: "{{ secret_key_prompt.user_input | trim }}"
+        credentials_already_stored: false
+      no_log: true
+      when: access_key_prompt is not skipped
+
+    - name: Fail with guidance if no key pair could be obtained
+      ansible.builtin.fail:
+        msg: |
+          No proxy cluster authentication key pair is available for
+          "{{ sdm_cluster_name }}", and prompting is disabled
+          (sdm_credentials_prompt=false).
+
+          {% if cluster_exists | bool %}
+          The cluster already exists, so this run did not create one — and
+          there is no CLI command to read back or mint a key for an existing
+          cluster.
+          {% else %}
+          The cluster may still have been created; the key pair just could not
+          be parsed out of the CLI output.
+          {% endif %}
+
+          Finish manually:
+
+            1. Admin UI > Networking > Proxy Clusters
+            2. Open "{{ sdm_cluster_name }}" > Keys > Add authentication key
+            3. Put the pair into vault.yml as:
+                 sdm_proxy_cluster_access_key: "pk-..."
+                 sdm_proxy_cluster_secret_key: "..."
+            4. Re-run. Cluster creation is skipped and the pair is stored to
+               credentials/{{ sdm_cluster_name }}.yml for future runs.
+
+          See README "Bring your own cluster".
+      when: cluster_access_key | length == 0 or cluster_secret_key | length == 0
+
+    # -- Persist -----------------------------------------------------------
+    # Written the instant the pair is known, before any instance is launched.
+    # If a later step blows up, the credentials survive and the next run is a
+    # resume rather than a restart.
+
+    - name: Create the credentials directory
+      ansible.builtin.file:
+        path: "{{ sdm_credentials_dir }}"
+        state: directory
+        mode: "0700"
+      when: not credentials_already_stored | bool
+
+    - name: Write the cluster credentials
+      ansible.builtin.copy:
+        dest: "{{ sdm_credentials_file }}"
+        mode: "0600"
+        content: |
+          ---
+          # StrongDM proxy cluster credentials — {{ sdm_cluster_name }}
+          #
+          # Written by site.yml on {{ ansible_date_time.iso8601 }} and encrypted
+          # with ansible-vault. Every worker in this cluster authenticates with
+          # this pair, and StrongDM will not show it again — so this file is the
+          # only copy. Back it up somewhere your team can reach.
+          #
+          # Read back automatically on the next run; nothing to do by hand.
+          sdm_cluster_name: {{ sdm_cluster_name }}
+          sdm_cluster_address: {{ cluster_address }}
+          sdm_cluster_access_key: "{{ cluster_access_key }}"
+          sdm_cluster_secret_key: "{{ cluster_secret_key }}"
+      no_log: true
+      when: not credentials_already_stored | bool
+
+    # copy writes plaintext, so encrypt in place immediately after. The
+    # password file is passed explicitly rather than left to ansible.cfg, so
+    # this works regardless of the directory the playbook was invoked from.
+    - name: Encrypt the credentials file
+      ansible.builtin.command:
+        argv:
+          - ansible-vault
+          - encrypt
+          - --vault-password-file
+          - "{{ sdm_vault_password_file | expanduser }}"
+          - "{{ sdm_credentials_file }}"
+      changed_when: true
+      when: not credentials_already_stored | bool
+
+    - name: Confirm the credentials are stored
+      ansible.builtin.debug:
+        msg: >-
+          Cluster credentials encrypted to
+          credentials/{{ sdm_cluster_name }}.yml. Keep it — adding a worker
+          later depends on it, and StrongDM cannot reissue this key pair.
+      when: not credentials_already_stored | bool
+
+    # Guards against the specific failure of pointing a rebuilt load balancer
+    # at an existing cluster: the address changed, the cluster's did not, and
+    # every client would be dialling an address that no longer exists.
+    - name: Warn if the stored address no longer matches the load balancer
+      ansible.builtin.debug:
+        msg: >-
+          The cluster was created for "{{ stored_cluster.sdm_cluster_address }}"
+          but this run resolved "{{ cluster_address }}". A proxy cluster's
+          address cannot be changed, so clients will still be sent to the old
+          one. This usually means the load balancer was destroyed and rebuilt —
+          see README "Rebuilding in nlb mode".
+      when:
+        - credentials_already_stored | bool
+        - stored_cluster.sdm_cluster_address | default('') | length > 0
+        - stored_cluster.sdm_cluster_address != cluster_address
+
+    # =====================================================================
+    # Instances
+    # =====================================================================
 
     # -- AMI ---------------------------------------------------------------
     # Resolved at runtime rather than hardcoded, so the playbook keeps working
@@ -189,101 +695,142 @@
           Using AMI {{ worker_ami_id }}
           ({{ (al2023_amis.images | sort(attribute='creation_date') | last).name }})
 
-    # -- Instance ----------------------------------------------------------
+    # ec2_instance matches on the Name tag, so this loop is add-only for free:
+    # a worker that already exists comes back unchanged, a new entry in
+    # workers.yml gets launched. Note that instance_type and volume size are
+    # only honoured at creation — resizing an existing worker is not something
+    # this playbook attempts.
 
-    - name: Launch the proxy worker instance
+    - name: Launch the proxy worker instances
       amazon.aws.ec2_instance:
         region: "{{ aws_region }}"
-        name: "{{ worker_name }}"
-        instance_type: "{{ instance_type }}"
+        name: "{{ item.name }}"
+        instance_type: "{{ item.instance_type }}"
         image_id: "{{ worker_ami_id }}"
         key_name: "{{ ssh_key_name }}"
-        vpc_subnet_id: "{{ target_subnet_id }}"
+        vpc_subnet_id: "{{ item.subnet_id }}"
         security_groups:
           - "{{ worker_sg.group_id }}"
         volumes:
           - device_name: /dev/xvda
             ebs:
-              volume_size: "{{ root_volume_gb }}"
+              volume_size: "{{ item.root_volume_gb }}"
               volume_type: gp3
               delete_on_termination: true
-        tags: "{{ resource_tags }}"
+        tags: "{{ resource_tags | combine({'Name': item.name}) }}"
         state: running
         wait: true
         wait_timeout: 600
-      register: worker_instance
+      loop: "{{ workers_resolved }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: worker_instances
 
-    - name: Set the instance id
-      ansible.builtin.set_fact:
-        worker_instance_id: "{{ (worker_instance.instances | first).instance_id }}"
-        worker_private_ip: "{{ (worker_instance.instances | first).private_ip_address }}"
-
-    # An Elastic IP matters more than it looks. StrongDM ties the cluster's
-    # advertised address to this IP, and there is no way to change a node's
-    # address after creation - so a reboot that reassigns a dynamic public IP
-    # would orphan the cluster. The EIP makes the demo survive stop/start.
-
-    - name: Allocate and associate an Elastic IP
+    # In nlb mode the load balancer fronts the fleet, so these are not the
+    # cluster's address any more — they exist to guarantee each worker a stable
+    # route out to app.strongdm.com and downloads.strongdm.com, and a stable
+    # address for Ansible. Set worker_assign_eip: false if the subnets already
+    # provide egress.
+    - name: Allocate and associate an Elastic IP per worker
       amazon.aws.ec2_eip:
         region: "{{ aws_region }}"
-        device_id: "{{ worker_instance_id }}"
+        device_id: "{{ (item.instances | first).instance_id }}"
         in_vpc: true
         release_on_disassociation: false
-        tags: "{{ resource_tags }}"
+        tags: "{{ resource_tags | combine({'Name': item.item.name}) }}"
         state: present
-      register: worker_eip
+      loop: "{{ worker_instances.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      register: worker_eips
+      when: worker_assign_eip | bool
 
-    - name: Set the worker public address
+    # One list of dicts describing the built fleet, assembled from the loops
+    # above. Everything downstream — inventory, target registration, the
+    # summary — reads from this instead of re-indexing loop results.
+    #
+    # public_ip falls back to whatever the instance was auto-assigned when EIPs
+    # are switched off, and to an empty string when it has none at all.
+    - name: Build the worker registry
       ansible.builtin.set_fact:
-        worker_public_ip: "{{ worker_eip.public_ip }}"
-        worker_advertised_address: "{{ worker_eip.public_ip }}:{{ sdm_worker_bind_port }}"
+        worker_registry: >-
+          {{ worker_registry | default([]) + [{
+               'name': item.item.name,
+               'instance_id': (item.instances | first).instance_id,
+               'private_ip': (item.instances | first).private_ip_address,
+               'public_ip': _public_ip,
+               'availability_zone': (item.instances | first).placement.availability_zone
+             }] }}
+      vars:
+        _idx: "{{ worker_registry | default([]) | length }}"
+        # `default('', true)` and not `default('')`: an instance with no public
+        # address returns the key as null rather than omitting it, and plain
+        # default() only substitutes for undefined.
+        _public_ip: >-
+          {{ (worker_eips.results[_idx | int].public_ip)
+             if worker_assign_eip | bool
+             else ((item.instances | first).public_ip_address | default('', true)) }}
+      loop: "{{ worker_instances.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
 
-    - name: Wait for SSH to accept connections
+    - name: Wait for SSH to accept connections on every worker
       ansible.builtin.wait_for:
-        host: "{{ worker_private_ip }}"
+        host: "{{ item.private_ip }}"
         port: 22
         delay: 5
         timeout: 300
         state: started
+      loop: "{{ worker_registry }}"
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Add the worker to the in-memory inventory
+    - name: Add the workers to the in-memory inventory
       ansible.builtin.add_host:
-        name: "{{ worker_name }}"
+        name: "{{ item.name }}"
         # Deliberately NOT sdm_workers. The aws_ec2 dynamic inventory also
-        # builds sdm_workers from the Project tag, and those hosts carry none of
-        # the facts below - so a play targeting sdm_workers would pick up an
-        # inventory-derived host (named by private IP) and fail on
-        # 'worker_advertised_address is undefined'. This group has exactly one
-        # member: the instance this run just provisioned.
+        # builds a group from the Project tag, and those hosts carry none of the
+        # facts below — so a play targeting it would pick up an inventory-derived
+        # host (named by private IP) and fail on undefined vars. This group holds
+        # exactly the workers this run provisioned or confirmed.
         groups: sdm_worker_target
-        ansible_host: "{{ worker_private_ip }}"
+        ansible_host: "{{ item.private_ip }}"
         ansible_user: "{{ remote_user }}"
         ansible_ssh_private_key_file: "{{ ssh_key_path | expanduser }}"
-        worker_public_ip: "{{ worker_public_ip }}"
-        worker_private_ip: "{{ worker_private_ip }}"
-        worker_instance_id: "{{ worker_instance_id }}"
-        worker_advertised_address: "{{ worker_advertised_address }}"
+        worker_public_ip: "{{ item.public_ip }}"
+        worker_private_ip: "{{ item.private_ip }}"
+        worker_instance_id: "{{ item.instance_id }}"
+        worker_availability_zone: "{{ item.availability_zone }}"
+      loop: "{{ worker_registry }}"
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Summarise the provisioned instance
+    - name: Summarise the fleet
       ansible.builtin.debug:
-        msg:
-          - "Instance:   {{ worker_instance_id }}"
-          - "Private IP: {{ worker_private_ip }}"
-          - "Public IP:  {{ worker_public_ip }}"
-          - "Advertised: {{ worker_advertised_address }}"
+        msg: >-
+          {{ item.name }} | {{ item.instance_id }} |
+          {{ item.availability_zone }} |
+          private {{ item.private_ip }} | public {{ item.public_ip | default('none') }}
+      loop: "{{ worker_registry }}"
+      loop_control:
+        label: "{{ item.name }}"
 
 
 # ===========================================================================
 
-- name: Create the proxy cluster and install the worker
+- name: Install the proxy worker on every node
   hosts: sdm_worker_target
   gather_facts: true
   become: true
-  # Stated explicitly because the cluster-creation tasks below use run_once,
-  # which does not behave predictably under the free strategy.
-  strategy: linear
   vars_files:
+    - workers.yml
     - vault.yml
+
+  vars:
+    # Resolved once in play 1 and read from there, rather than re-derived per
+    # host. Every worker in the cluster shares this one pair.
+    worker_access_key: "{{ hostvars['localhost'].cluster_access_key | default('') }}"
+    worker_secret_key: "{{ hostvars['localhost'].cluster_secret_key | default('') }}"
 
   handlers:
     - name: Restart the StrongDM worker
@@ -293,136 +840,25 @@
 
   tasks:
 
-    # Fail fast and legibly if this play was reached without Play 1's facts -
+    # Fail fast and legibly if this play was reached without play 1's facts —
     # e.g. by running with `--limit` or targeting the group by hand.
     - name: Assert that the provisioning facts arrived from play 1
       ansible.builtin.assert:
         that:
-          - worker_advertised_address is defined
-          - worker_public_ip is defined
           - worker_private_ip is defined
+          - worker_access_key | default('') | length > 0
+          - worker_secret_key | default('') | length > 0
         fail_msg: >-
-          Provisioning facts are missing. This play must run as part of
-          site.yml, which sets them in play 1 via add_host. Run
+          Provisioning facts or cluster credentials are missing. This play must
+          run as part of site.yml, which sets them in play 1. Run
           `ansible-playbook site.yml` rather than targeting this play directly.
         quiet: true
-
-    # -- Create the cluster in StrongDM ------------------------------------
-    # Runs on the control node (delegate_to: localhost) because that is where
-    # the authenticated sdm CLI lives. The instance itself never holds an
-    # admin token - it only ever receives a cluster-scoped key pair.
-
-    - name: Check whether the proxy cluster already exists
-      ansible.builtin.command:
-        cmd: sdm admin nodes list --json --filter "name:{{ sdm_cluster_name }}"
-      environment:
-        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
-        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
-      delegate_to: localhost
-      become: false
-      run_once: true
-      register: existing_cluster
-      changed_when: false
-      failed_when: false
-      no_log: true
-
-    # Without this, a second run would create a duplicate cluster in StrongDM -
-    # the worker install is idempotent but cluster creation was not.
-    - name: Record whether that cluster is already present
-      ansible.builtin.set_fact:
-        cluster_exists: >-
-          {{ sdm_cluster_name in (existing_cluster.stdout | default('')) }}
-      run_once: true
-
-    - name: Decide whether a key pair was supplied
-      ansible.builtin.set_fact:
-        byo_cluster: >-
-          {{ (sdm_proxy_cluster_access_key | default('') | length > 0)
-             and (sdm_proxy_cluster_secret_key | default('') | length > 0) }}
-
-    - name: Create the proxy cluster
-      ansible.builtin.command:
-        cmd: >-
-          sdm admin nodes create-proxy-cluster
-          --name {{ sdm_cluster_name }}
-          --tags Project=strongdm-ansible-demo,ManagedBy=ansible
-          {{ worker_advertised_address }}
-      environment:
-        SDM_ADMIN_TOKEN: "{{ sdm_admin_token }}"
-        SDM_APP_DOMAIN: "{{ sdm_app_domain }}"
-      delegate_to: localhost
-      become: false
-      run_once: true
-      register: cluster_create
-      changed_when: cluster_create.rc == 0
-      when:
-        - not byo_cluster | bool
-        - not cluster_exists | bool
-      no_log: true
-
-    # `create-proxy-cluster` prints the cluster's first authentication key on
-    # success. The exact output format is not documented, so parse defensively
-    # and fail with instructions rather than dying on an index error.
-
-    - name: Extract the cluster authentication key pair
-      vars:
-        # regex_findall returns the capture groups as a list, which avoids
-        # backreference escaping entirely. An empty list is a clean "not found".
-        _cluster_out: "{{ cluster_create.stdout | default('') }}"
-        _access_matches: "{{ _cluster_out | regex_findall('pk-[0-9a-zA-Z]{8,}') }}"
-        _secret_matches: "{{ _cluster_out | regex_findall('secret[-_ ]?key[ :=]*([A-Za-z0-9+/=_-]{16,})', ignorecase=true) }}"
-      ansible.builtin.set_fact:
-        parsed_access_key: "{{ _access_matches[0] if _access_matches | length > 0 else '' }}"
-        parsed_secret_key: "{{ _secret_matches[0] if _secret_matches | length > 0 else '' }}"
-      run_once: true
-      when:
-        - not byo_cluster | bool
-        - not cluster_exists | bool
-      no_log: true
-
-    - name: Settle on the credentials the worker will use
-      ansible.builtin.set_fact:
-        worker_access_key: >-
-          {{ sdm_proxy_cluster_access_key if byo_cluster | bool
-             else parsed_access_key | default('') }}
-        worker_secret_key: >-
-          {{ sdm_proxy_cluster_secret_key if byo_cluster | bool
-             else parsed_secret_key | default('') }}
-      no_log: true
-
-    - name: Fail with guidance if no key pair could be obtained
-      ansible.builtin.fail:
-        msg: |
-          No proxy cluster authentication key pair is available.
-
-          {% if cluster_exists | bool %}
-          The cluster "{{ sdm_cluster_name }}" already exists, so this run did
-          not create one - and there is no CLI command to mint a key for an
-          existing cluster.
-          {% else %}
-          The cluster may still have been created; the key pair just could not
-          be parsed out of the CLI output.
-          {% endif %}
-
-          Finish manually:
-
-            1. StrongDM Admin UI > Networking > Proxy Clusters
-            2. Open "{{ sdm_cluster_name }}" > Keys tab > Add authentication key
-            3. Put the pair into vault.yml as:
-                 sdm_proxy_cluster_access_key: "pk-..."
-                 sdm_proxy_cluster_secret_key: "..."
-            4. Re-run this playbook. It will skip cluster creation and go
-               straight to installing the worker.
-
-          See README "Bring your own cluster".
-      when:
-        - worker_access_key | length == 0 or worker_secret_key | length == 0
 
     # -- Host preparation --------------------------------------------------
 
     - name: Set the hostname
       ansible.builtin.hostname:
-        name: "{{ worker_name }}"
+        name: "{{ inventory_hostname }}"
 
     - name: Install packages the StrongDM installer needs
       ansible.builtin.dnf:
@@ -484,14 +920,16 @@
       when: not sdm_installed.stat.exists
 
     # The documented install flow is interactive: it prompts for the access key
-    # and then the secret key. Two things make it unattended here -
+    # and then the secret key. Two things make it unattended here —
     #   1. the keys are exported as SDM_PROXY_CLUSTER_* env vars, which the
     #      worker reads natively, and
     #   2. the same pair is piped on stdin, which satisfies the prompts if the
     #      installer asks anyway.
     # Whichever path the binary takes, the task completes without a TTY.
     #
-    # `creates:` makes this idempotent - a second run is a no-op.
+    # Every worker gets the same pair — that is how they join one cluster
+    # rather than becoming several. `creates:` makes this idempotent, so a
+    # worker added later installs while the existing fleet is a no-op.
     - name: Install the StrongDM proxy worker as a systemd service
       ansible.builtin.command:
         cmd: >-
@@ -513,7 +951,7 @@
     # are layered in with lineinfile rather than templating the whole file and
     # clobbering what the installer put there.
 
-    - name: Ensure the credentials are persisted in the environment file
+    - name: Ensure the required settings are in the environment file
       ansible.builtin.lineinfile:
         path: "{{ sdm_env_file }}"
         regexp: "^{{ item.key }}="
@@ -526,6 +964,11 @@
         - { key: SDM_PROXY_CLUSTER_ACCESS_KEY, value: "{{ worker_access_key }}" }
         - { key: SDM_PROXY_CLUSTER_SECRET_KEY, value: "{{ worker_secret_key }}" }
         - { key: SDM_APP_DOMAIN, value: "{{ sdm_app_domain }}" }
+        # Enables the liveness endpoint the load balancer health-checks, and
+        # with it the coordinated rolling restart during maintenance windows.
+        # Without this the workers upgrade independently and the load balancer
+        # has no way to know one is going away.
+        - { key: SDM_ORCHESTRATOR_PROBES, value: ":{{ sdm_liveness_port }}" }
       loop_control:
         label: "{{ item.key }}"
       no_log: true
@@ -569,7 +1012,7 @@
         timeout: 120
         state: started
 
-    # A healthy proxy worker answers HTTPS with 404 - it is a TLS proxy, not a
+    # A healthy proxy worker answers HTTPS with 404 — it is a TLS proxy, not a
     # web server, so 404 is the documented success signal.
     - name: Confirm the worker answers with HTTP 404
       ansible.builtin.uri:
@@ -583,14 +1026,91 @@
       delay: 10
       until: worker_probe is succeeded
 
-    - name: Done
+    # Checked here, on the worker itself, before the load balancer is asked to
+    # depend on it. A target group whose health check never passes is a slow
+    # and confusing failure; a 200 from this endpoint is a fast and clear one.
+    - name: Confirm the liveness endpoint answers with HTTP 200
+      ansible.builtin.uri:
+        url: "http://{{ worker_private_ip }}:{{ sdm_liveness_port }}{{ sdm_liveness_path }}"
+        status_code:
+          - 200
+        timeout: 30
+      register: liveness_probe
+      retries: 6
+      delay: 10
+      until: liveness_probe is succeeded
+
+    - name: Report this worker
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ worker_availability_zone }}):
+          {{ sdm_service_name }}
+          {{ sdm_service.status.ActiveState | default('unknown') }},
+          traffic HTTP {{ worker_probe.status }} (404 = healthy),
+          liveness HTTP {{ liveness_probe.status }}
+
+
+# ===========================================================================
+
+- name: Put the workers into rotation and report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - workers.yml
+
+  tasks:
+
+    # Registered after the install, not before, so the target group never holds
+    # a worker that cannot answer a health check. state: present with no purge
+    # keeps this add-only: an existing target is left alone.
+    - name: Register the workers with the load balancer
+      community.aws.elb_target:
+        region: "{{ aws_region }}"
+        target_group_name: "{{ nlb_target_group_name }}"
+        target_id: "{{ item.instance_id }}"
+        target_port: "{{ sdm_worker_bind_port }}"
+        state: present
+        # Waits for the liveness health check to pass, which is the real
+        # end-to-end proof: the worker is up, the security group allows the
+        # health check through, and the load balancer will send it traffic.
+        target_status: healthy
+        target_status_timeout: 300
+      loop: "{{ worker_registry }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: sdm_cluster_endpoint == 'nlb'
+
+    - name: Report the finished cluster
       ansible.builtin.debug:
         msg:
-          - "Proxy worker installed natively via binary + systemd."
-          - "Cluster:    {{ sdm_cluster_name }}"
-          - "Advertised: {{ worker_advertised_address }}"
-          - "Service:    {{ sdm_service_name }} ({{ sdm_service.status.ActiveState | default('unknown') }})"
-          - "Probe:      HTTP {{ worker_probe.status }} (404 = healthy)"
+          - "Cluster:  {{ sdm_cluster_name }}"
+          - "Address:  {{ cluster_address }}"
+          - "Workers:  {{ worker_registry | length }} in {{ worker_registry | map(attribute='availability_zone') | unique | sort | join(', ') }}"
           - ""
-          - "Next: attach a resource to this cluster in the Admin UI under"
-          - "Networking > Proxy Clusters, or with --proxy-cluster-id at the CLI."
+          - "Attach resources to the cluster in the Admin UI under Networking >"
+          - "Proxy Clusters, or with --proxy-cluster-id at the CLI. Resources"
+          - "attach to the cluster, not to a worker, so this is a one-time step."
+          - ""
+          - "Adding a worker later: append it to sdm_workers in workers.yml and"
+          - "re-run. The stored credentials in credentials/{{ sdm_cluster_name }}.yml"
+          - "are what let it join this cluster instead of forming a new one."
+
+    - name: Explain the remaining manual step in manual mode
+      ansible.builtin.debug:
+        msg:
+          - "sdm_cluster_endpoint is \"manual\", so no load balancer was created."
+          - ""
+          - "Point {{ sdm_cluster_hostname }} at your load balancer, and register"
+          - "these workers as its backends on port {{ sdm_worker_bind_port }}:"
+          - "{{ worker_registry | map(attribute='public_ip') | list }}"
+          - ""
+          - "Health check {{ sdm_liveness_path }} on port {{ sdm_liveness_port }}"
+          - "expecting HTTP 200 — NOT the traffic port. A worker draining for a"
+          - "rolling upgrade keeps serving traffic but shuts the liveness port"
+          - "down, which is how it asks to be taken out of rotation."
+          - ""
+          - "Use a layer-4 / TCP passthrough listener. The workers terminate"
+          - "mutual TLS themselves, so anything that terminates TLS for them"
+          - "will break the handshake."
+      when: sdm_cluster_endpoint == 'manual'

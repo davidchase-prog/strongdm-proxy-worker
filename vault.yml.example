@@ -14,12 +14,21 @@
 # Settings > Admin Tokens. The playbook exports this as SDM_ADMIN_TOKEN so the
 # sdm CLI can authenticate without an interactive login.
 #
-# Scope it to the minimum your sandbox allows. A token with node-management
+# Scope it to the minimum your environment allows. A token with node-management
 # rights is enough; it does not need resource or user administration.
 sdm_admin_token: "REPLACE_ME"
 
-# Only needed if you are supplying a pre-existing cluster instead of letting
-# the playbook create one. See "Bring your own cluster" in the README.
+# ---------------------------------------------------------------------------
+# Bring your own cluster (optional)
+# ---------------------------------------------------------------------------
+# Set these to use a key pair you already hold — from the Admin UI, or from a
+# cluster this playbook did not create. They take precedence over both cluster
+# creation and credentials/<cluster>.yml.
+#
+# You usually do NOT need them. On its first run the playbook creates the
+# cluster and encrypts the pair to credentials/<cluster>.yml, and every run
+# after that reads it back — which is what makes adding a worker a one-line
+# change to workers.yml. Use these only to adopt a cluster from outside.
 #
 # sdm_proxy_cluster_access_key: "pk-0123456789abcdef"
 # sdm_proxy_cluster_secret_key: "REPLACE_ME"

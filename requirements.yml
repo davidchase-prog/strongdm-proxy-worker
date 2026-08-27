@@ -6,6 +6,12 @@ collections:
   # settled there.
   - name: amazon.aws
     version: ">=6.0.0"
+  # Needed only for the network load balancer in nlb mode: elb_network_lb,
+  # elb_target_group, and elb_target still live here rather than in amazon.aws.
+  # If a future amazon.aws release absorbs them, drop this and change the
+  # collection prefix on those three tasks in site.yml and teardown.yml.
+  - name: community.aws
+    version: ">=6.0.0"
   - name: community.crypto
     version: ">=2.0.0"
   - name: ansible.posix
